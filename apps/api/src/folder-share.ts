@@ -141,6 +141,15 @@ export async function folderBreadcrumbsToRoot(
  * The archiver is provided by caller (so caller can pipe to reply first, then
  * await this function, then call archive.finalize()).
  */
+// Bound a folder-share ZIP so a single recipient can't request a multi-TB
+// archive and tie up the API + a node forever. Configurable via env.
+const MAX_FOLDER_ZIP_FILES = Math.max(1, Number(process.env.MAX_FOLDER_ZIP_FILES ?? 5000));
+const MAX_FOLDER_ZIP_DEPTH = Math.max(1, Number(process.env.MAX_FOLDER_ZIP_DEPTH ?? 32));
+const MAX_FOLDER_ZIP_BYTES = Math.max(
+  1024 * 1024,
+  Number(process.env.MAX_FOLDER_ZIP_BYTES ?? 10 * 1024 * 1024 * 1024) // 10 GiB default
+);
+
 export async function streamFolderAsZip(
   prisma: PrismaClient,
   archive: archiver.Archiver,
@@ -164,7 +173,11 @@ async function walk(
   setCount: (count: number) => void
 ): Promise<void> {
   let count = 0;
-  async function visit(currentFolderId: string, currentPrefix: string): Promise<void> {
+  let totalBytes = 0n;
+  async function visit(currentFolderId: string, currentPrefix: string, depth: number): Promise<void> {
+    if (depth > MAX_FOLDER_ZIP_DEPTH) {
+      throw new Error(`folder share zip: depth limit ${MAX_FOLDER_ZIP_DEPTH} exceeded`);
+    }
     const subfolders = await prisma.folder.findMany({
       where: { parentId: currentFolderId },
       orderBy: { name: "asc" },
@@ -179,6 +192,14 @@ async function walk(
     for (const file of files) {
       const version = file.versions[0];
       if (!version) continue;
+      if (count >= MAX_FOLDER_ZIP_FILES) {
+        throw new Error(`folder share zip: file count limit ${MAX_FOLDER_ZIP_FILES} exceeded`);
+      }
+      const fileSize = file.sizeBytes ?? 0n;
+      if (totalBytes + fileSize > BigInt(MAX_FOLDER_ZIP_BYTES)) {
+        throw new Error(`folder share zip: ${MAX_FOLDER_ZIP_BYTES} byte budget exceeded`);
+      }
+      totalBytes += fileSize;
       const zipPath = `${currentPrefix}/${file.name}`;
       // Empty folders are skipped naturally; archiver auto-creates intermediate
       // directory entries when files are added with slash-separated paths.
@@ -191,10 +212,10 @@ async function walk(
     }
 
     for (const sub of subfolders) {
-      await visit(sub.id, `${currentPrefix}/${sub.name}`);
+      await visit(sub.id, `${currentPrefix}/${sub.name}`, depth + 1);
     }
   }
-  await visit(folderId, prefix);
+  await visit(folderId, prefix, 0);
   setCount(count);
 }
 

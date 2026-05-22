@@ -357,6 +357,12 @@ export function absoluteAppUrl(pathOrUrl: string): string {
   }
 }
 
+// Paths under which a 401 should NOT trigger an auto-redirect to /login.
+// Login flow itself: /auth/login returns 401 on wrong password — handling
+// that as a logout would create a loop. Also /auth/me on bootstrap returns
+// 401 when there's no session yet; we let App decide what to render.
+const NO_REDIRECT_ON_401 = ["/auth/login", "/auth/me"];
+
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const hasBody = init.body !== undefined && init.body !== null;
   const headers = new Headers(init.headers);
@@ -371,6 +377,16 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   });
 
   if (!response.ok) {
+    // Global 401 handling: server says session is dead → bounce to login.
+    // Skip if the caller is the login/me endpoint itself.
+    if (response.status === 401 && !NO_REDIRECT_ON_401.some((p) => path.startsWith(p))) {
+      // Don't redirect from share-link recipient pages; those have their own
+      // auth flow and aren't under /api/auth.
+      if (!window.location.pathname.startsWith("/s/") && !window.location.pathname.startsWith("/share")) {
+        // Tiny delay so any in-flight UI sees the error first.
+        setTimeout(() => { window.location.href = "/login"; }, 100);
+      }
+    }
     throw new ApiError(response.status, await readErrorMessage(response));
   }
 

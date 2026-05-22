@@ -76,19 +76,32 @@ export function TextFileEditor({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dirty, content]);
 
-  // Ctrl/Cmd+S to save.
+  // Ctrl/Cmd+S to save. ESC: confirm if dirty, otherwise close.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key === "s") {
         e.preventDefault();
         void save();
+        return;
       }
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") {
+        if (dirtyRef.current) {
+          // eslint-disable-next-line no-alert
+          if (!window.confirm("有未保存的修改,确定关闭?")) return;
+        }
+        onClose();
+      }
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Also guard the X button: if dirty, confirm before letting onClose run.
+  const guardedClose = () => {
+    if (dirtyRef.current && !window.confirm("有未保存的修改,确定关闭?")) return;
+    onClose();
+  };
 
   // Warn before unload if there are unsaved changes.
   useEffect(() => {
@@ -153,7 +166,7 @@ export function TextFileEditor({
                 <Save size={12} /> 保存
               </button>
             )}
-            <button type="button" className="btn btn-ghost btn-sm" onClick={onClose}>
+            <button type="button" className="btn btn-ghost btn-sm" onClick={guardedClose}>
               <X size={14} />
             </button>
           </div>

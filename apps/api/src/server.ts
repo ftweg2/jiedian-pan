@@ -71,8 +71,15 @@ export async function buildServer(env: ApiEnv, prisma: PrismaClient) {
   });
 
   await app.register(cookie, { secret: env.cookieSecret });
+  // CORS — refuse to combine wildcard origin with credentials because that
+  // turns CSRF defenses off entirely. If someone sets CORS_ORIGIN=*, fail fast
+  // so they notice rather than silently allowing credentialed cross-origin
+  // requests from any site on the internet.
+  if (env.corsOrigin === "*") {
+    throw new Error("CORS_ORIGIN=* is unsafe with credentialed sessions. Set CORS_ORIGIN to your actual frontend origin (e.g. http://localhost:8080).");
+  }
   await app.register(cors, {
-    origin: env.corsOrigin === "*" ? true : env.corsOrigin,
+    origin: env.corsOrigin,
     credentials: true
   });
   await app.register(multipart, {
@@ -154,7 +161,10 @@ export async function buildServer(env: ApiEnv, prisma: PrismaClient) {
       return reply.code(503).send({ error: message });
     }
 
-    return reply.code(500).send({ error: message || "internal server error" });
+    // Anything that fell through to here is an unexpected error. Don't echo
+    // the raw message to the client — it can include filesystem paths, stack
+    // hints, library internals, etc. The full error is in the request log.
+    return reply.code(500).send({ error: "internal server error" });
   });
 
   app.get("/health", async () => ({ ok: true }));
@@ -323,20 +333,36 @@ export async function buildServer(env: ApiEnv, prisma: PrismaClient) {
         if (!destination || !(await canAccessFolder(prisma, user, destination, "write"))) {
           return reply.code(404).send({ error: "destination folder not found" });
         }
-        if (await isDescendantOf(prisma, body.parentId, folder.id)) {
-          return reply.code(400).send({ error: "cannot move a folder into its own subtree" });
-        }
       }
     }
 
-    const updated = await prisma.folder.update({
-      where: { id: folder.id },
-      data: {
-        name: body.name ?? undefined,
-        defaultPolicy: body.defaultPolicy ? toDbPolicy(body.defaultPolicy) : undefined,
-        parentId: body.parentId === undefined ? undefined : body.parentId
+    // Serialize the cycle check + the actual move in one transaction. Without
+    // this, two concurrent moves (A→B and B→A) can both pass the check and
+    // create an A↔B loop. Serializable isolation makes the check observe
+    // any pending parentId changes from a competing transaction.
+    let updated;
+    try {
+      updated = await prisma.$transaction(async (tx) => {
+        if (body.parentId !== undefined && body.parentId !== null) {
+          if (await isDescendantOf(tx as unknown as PrismaClient, body.parentId, folder.id)) {
+            throw new Error("__CYCLE__");
+          }
+        }
+        return tx.folder.update({
+          where: { id: folder.id },
+          data: {
+            name: body.name ?? undefined,
+            defaultPolicy: body.defaultPolicy ? toDbPolicy(body.defaultPolicy) : undefined,
+            parentId: body.parentId === undefined ? undefined : body.parentId
+          }
+        });
+      }, { isolationLevel: "Serializable" });
+    } catch (err) {
+      if (err instanceof Error && err.message === "__CYCLE__") {
+        return reply.code(400).send({ error: "cannot move a folder into its own subtree" });
       }
-    });
+      throw err;
+    }
     return { folder: serializeFolder(updated) };
   });
 
@@ -418,6 +444,16 @@ export async function buildServer(env: ApiEnv, prisma: PrismaClient) {
           ...(q ? { name: { contains: q, mode: "insensitive" as const } } : {})
         };
 
+    // Pagination for recursive search (cursor-based, by createdAt + id).
+    //  - cursor: file id from previous page's last item
+    //  - pageSize: 1..200, default 100
+    // Non-recursive (single folder) still returns everything in the folder so
+    // the UI doesn't have to paginate; folder size is bounded by users.
+    const pageSize = recursive
+      ? Math.max(1, Math.min(200, Number(query.pageSize ?? 100)))
+      : undefined;
+    const cursor = recursive && query.cursor ? { id: String(query.cursor) } : undefined;
+
     const files = await prisma.file.findMany({
       where,
       include: {
@@ -428,17 +464,25 @@ export async function buildServer(env: ApiEnv, prisma: PrismaClient) {
           include: { replicas: true }
         }
       },
-      orderBy: { createdAt: "desc" },
-      take: recursive ? 500 : undefined // cap recursive search to keep response bounded
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      ...(pageSize ? { take: pageSize + 1 } : {}),
+      ...(cursor ? { cursor, skip: 1 } : {})
     });
 
+    let nextCursor: string | null = null;
+    let page = files;
+    if (pageSize && files.length > pageSize) {
+      nextCursor = files[pageSize - 1].id;
+      page = files.slice(0, pageSize);
+    }
+
     const visible = [];
-    for (const file of files) {
+    for (const file of page) {
       if (await canAccessFile(prisma, user, file, "read")) {
         visible.push(serializeFile(file));
       }
     }
-    return { files: visible };
+    return { files: visible, nextCursor };
   });
 
   app.get("/files/risks", async (request, reply) => {
@@ -761,7 +805,17 @@ export async function buildServer(env: ApiEnv, prisma: PrismaClient) {
     if (!user) return;
 
     const body = newFileSchema.parse(request.body);
+    // Defense in depth: bail out before base64-decoding a huge string. The
+    // route's bodyLimit catches truly enormous JSON, but checking the encoded
+    // length explicitly means a single attacker payload can't OOM us between
+    // parse and resolveNewFileContent.
+    if (body.contentBase64 && body.contentBase64.length > Math.ceil(env.maxUploadBytes * 1.4)) {
+      return reply.code(413).send({ error: "content too large" });
+    }
     const content = await resolveNewFileContent(body);
+    if (content.byteLength > env.maxUploadBytes) {
+      return reply.code(413).send({ error: "content too large" });
+    }
     const folder = await resolveWritableUploadFolder(prisma, user, body.folderId ?? null);
     const folderDefault = folder ? toSharedPolicy(folder.defaultPolicy) : "standard";
     const policy = folderDefault;
@@ -1295,9 +1349,13 @@ export async function buildServer(env: ApiEnv, prisma: PrismaClient) {
     return reply.code(204).send();
   });
 
-  app.get<{ Params: { id: string } }>("/files/:id/versions", async (request, reply) => {
+  app.get<{ Params: { id: string }; Querystring: { limit?: string } }>("/files/:id/versions", async (request, reply) => {
     const user = await requireUser(prisma, request, reply);
     if (!user) return;
+
+    // Bound the response. A file with 1000+ versions (e.g. an editor doc with
+    // autosave on for months) would otherwise blow up the response.
+    const limit = Math.max(1, Math.min(200, Number(request.query.limit ?? 50)));
 
     const file = await prisma.file.findUnique({
       where: { id: request.params.id },
@@ -1305,6 +1363,7 @@ export async function buildServer(env: ApiEnv, prisma: PrismaClient) {
         folder: true,
         versions: {
           orderBy: { createdAt: "desc" },
+          take: limit,
           include: {
             replicas: { include: { node: true } },
             chunks: {
@@ -1708,11 +1767,25 @@ export async function buildServer(env: ApiEnv, prisma: PrismaClient) {
       return reply.code(404).send({ error: "share not found or expired" });
     }
 
+    // Rate-limit password attempts here too (previously only /authorize had it).
+    // A POST /download with the wrong password was unlimited, defeating the
+    // brute-force protection. Same bucket as /authorize so an attacker can't
+    // cheat by mixing endpoints.
+    if (share.passwordHash) {
+      const limit = checkShareAuthRateLimit(request, share.id);
+      if (!limit.allowed) {
+        reply.header("retry-after", String(limit.retryAfterSec));
+        return reply.code(429).send({ error: `too many attempts; retry in ${limit.retryAfterSec}s` });
+      }
+    }
+
     const body = shareDownloadSchema.parse(request.body ?? {});
     if (share.passwordHash && !(await verifyPassword(share.passwordHash, body.password ?? ""))) {
       await logAccess(prisma, request, { shareLinkId: share.id, fileId: share.fileId, action: "share_download", result: "bad_password" });
       return reply.code(403).send({ error: "invalid password" });
     }
+    // Password OK (or no password). Forgive any prior failed attempts for this IP+share.
+    if (share.passwordHash) resetShareAuthRateLimit(request, share.id);
 
     const downloadCount = share.downloadCount + 1;
     const reserved = await prisma.shareLink.updateMany({
@@ -2743,8 +2816,12 @@ const SHARE_AUTH_MAX_ATTEMPTS = 5;
 const shareAuthAttempts = new Map<string, { attempts: number[]; }>();
 
 function shareAuthRateLimitKey(request: FastifyRequest, shareId: string): string {
-  const ip = (request.headers["x-forwarded-for"] ?? request.ip).toString().split(",")[0].trim();
-  return `${ip}:${shareId}`;
+  // Use Fastify's request.ip (socket-level) instead of trusting the
+  // X-Forwarded-For header. We don't enable trustProxy, so request.ip is
+  // the nginx container IP — that's a single bucket, fine for a personal
+  // cloud. Trusting client-supplied XFF lets an attacker bypass per-IP
+  // rate limits by rotating the header value.
+  return `${request.ip}:${shareId}`;
 }
 
 function checkShareAuthRateLimit(request: FastifyRequest, shareId: string): { allowed: boolean; retryAfterSec: number } {
