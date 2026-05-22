@@ -1,0 +1,20 @@
+services:
+  storage-agent:
+    build:
+      context: .
+      dockerfile: docker/storage-agent.Dockerfile
+    restart: unless-stopped
+    environment:
+      PORT: 4010
+      HOST: 0.0.0.0
+      NODE_ID: ${NODE_ID:?NODE_ID is required}
+      AGENT_TOKEN: ${AGENT_TOKEN:?AGENT_TOKEN is required}
+      AGENT_DATA_DIR: /data/objects
+      AGENT_MAX_OBJECT_BYTES: ${AGENT_MAX_OBJECT_BYTES:-1073741824}
+    volumes:
+      - agent-data:/data/objects
+    ports:
+      - "4010:4010"
+
+volumes:
+  agent-data:

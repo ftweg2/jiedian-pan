@@ -1,0 +1,74 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: wangpan
+      POSTGRES_USER: wangpan
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wangpan -d wangpan"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  storage-agent-local:
+    build:
+      context: .
+      dockerfile: docker/storage-agent.Dockerfile
+    restart: unless-stopped
+    environment:
+      PORT: 4010
+      HOST: 0.0.0.0
+      NODE_ID: main-local
+      AGENT_TOKEN: ${LOCAL_AGENT_TOKEN:?LOCAL_AGENT_TOKEN is required}
+      AGENT_DATA_DIR: /data/objects
+    volumes:
+      - local-agent-data:/data/objects
+    expose:
+      - "4010"
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      storage-agent-local:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgresql://wangpan:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/wangpan
+      APP_MASTER_KEY: ${APP_MASTER_KEY:?APP_MASTER_KEY is required}
+      COOKIE_SECRET: ${COOKIE_SECRET:?COOKIE_SECRET is required}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      PORT: 4000
+      HOST: 0.0.0.0
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:8080}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8080}
+      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-536870912}
+      SESSION_TTL_DAYS: ${SESSION_TTL_DAYS:-14}
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:?BOOTSTRAP_ADMIN_EMAIL is required}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:?BOOTSTRAP_ADMIN_PASSWORD is required}
+      BOOTSTRAP_LOCAL_NODE_NAME: ${BOOTSTRAP_LOCAL_NODE_NAME:-main-local}
+      BOOTSTRAP_LOCAL_NODE_URL: ${BOOTSTRAP_LOCAL_NODE_URL:-http://storage-agent-local:4010}
+      BOOTSTRAP_LOCAL_NODE_TOKEN: ${LOCAL_AGENT_TOKEN:?LOCAL_AGENT_TOKEN is required}
+    ports:
+      - "4000:4000"
+
+  web:
+    build:
+      context: .
+      dockerfile: docker/web.Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "8080:80"
+
+volumes:
+  postgres-data:
+  local-agent-data:

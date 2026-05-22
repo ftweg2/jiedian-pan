@@ -1,0 +1,27 @@
+{
+  "name": "wangpan-e2e",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm -w @wangpan/shared run build && npm -w @wangpan/storage-driver run build && npm -w @wangpan/storage-agent run build && npm -w @wangpan/api run build && npm -w @wangpan/web run build",
+    "test": "npm -ws --if-present run test",
+    "dev:api": "npm -w @wangpan/api run dev",
+    "dev:web": "npm -w @wangpan/web run dev",
+    "dev:agent": "npm -w @wangpan/storage-agent run dev",
+    "db:migrate": "npm -w @wangpan/api run db:migrate",
+    "prisma:generate": "npm -w @wangpan/api run prisma:generate"
+  },
+  "devDependencies": {
+    "@types/archiver": "^7.0.0",
+    "@types/node": "^22.15.21",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

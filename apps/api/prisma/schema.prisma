@@ -1,0 +1,306 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  ADMIN  @map("admin")
+  MEMBER @map("member")
+}
+
+enum StoragePolicy {
+  STANDARD  @map("standard")
+  IMPORTANT @map("important")
+  TEMPORARY @map("temporary")
+}
+
+enum PermissionLevel {
+  READ   @map("read")
+  WRITE  @map("write")
+  MANAGE @map("manage")
+}
+
+enum FileStatus {
+  PENDING @map("pending")
+  ACTIVE  @map("active")
+  FAILED  @map("failed")
+  TRASHED @map("trashed")
+  DELETED @map("deleted")
+}
+
+enum ReplicaStatus {
+  PENDING   @map("pending")
+  AVAILABLE @map("available")
+  MISSING   @map("missing")
+  DELETED   @map("deleted")
+}
+
+enum StorageNodeStatus {
+  ACTIVE   @map("active")
+  DEGRADED @map("degraded")
+  OFFLINE  @map("offline")
+  DISABLED @map("disabled")
+}
+
+enum ShareStatus {
+  ACTIVE  @map("active")
+  EXPIRED @map("expired")
+  REVOKED @map("revoked")
+}
+
+enum JobStatus {
+  PENDING @map("pending")
+  RUNNING @map("running")
+  DONE    @map("done")
+  FAILED  @map("failed")
+}
+
+enum FileVersionStorageLayout {
+  WHOLE   @map("whole")
+  CHUNKED @map("chunked")
+}
+
+model User {
+  id           String     @id @default(cuid())
+  email        String     @unique
+  name         String
+  role         UserRole   @default(MEMBER)
+  passwordHash String
+  disabledAt   DateTime?
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+  sessions     Session[]
+  folders      Folder[]
+  files        File[]
+  permissions  Permission[]
+  shares       ShareLink[] @relation("ShareCreator")
+  accessLogs   AccessLog[]
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  tokenHash String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model Folder {
+  id            String        @id @default(cuid())
+  name          String
+  ownerId       String
+  parentId      String?
+  defaultPolicy StoragePolicy @default(STANDARD)
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  owner         User          @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  parent        Folder?       @relation("FolderTree", fields: [parentId], references: [id], onDelete: SetNull)
+  children      Folder[]      @relation("FolderTree")
+  files         File[]
+  permissions   Permission[]
+  shares        ShareLink[]   @relation("FolderShare")
+
+  @@index([ownerId, parentId])
+}
+
+model File {
+  id             String         @id @default(cuid())
+  name           String
+  mimeType       String
+  sizeBytes      BigInt
+  ownerId        String
+  folderId       String?
+  policyOverride StoragePolicy?
+  expiresAt      DateTime?
+  status         FileStatus     @default(PENDING)
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+  owner          User           @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  folder         Folder?        @relation(fields: [folderId], references: [id], onDelete: SetNull)
+  versions       FileVersion[]
+  permissions    Permission[]
+  shares         ShareLink[]
+  accessLogs     AccessLog[]
+
+  @@index([ownerId, folderId])
+  @@index([status, expiresAt])
+}
+
+model FileVersion {
+  id                 String          @id @default(cuid())
+  fileId             String
+  objectKey          String
+  plaintextSha256    String
+  ciphertextSha256   String
+  encryptionNonce    String
+  encryptionAuthTag  String
+  wrappedKey         String
+  sizeBytes          BigInt
+  storageLayout      FileVersionStorageLayout @default(WHOLE)
+  chunkSizeBytes     BigInt?
+  chunkCount         Int?
+  createdAt          DateTime        @default(now())
+  file               File            @relation(fields: [fileId], references: [id], onDelete: Cascade)
+  replicas           ObjectReplica[]
+  chunks             FileChunk[]
+
+  @@index([fileId, createdAt])
+  @@index([storageLayout])
+}
+
+model StorageNode {
+  id              String            @id @default(cuid())
+  name            String
+  baseUrl         String
+  agentToken      String
+  status          StorageNodeStatus @default(ACTIVE)
+  priority        Int               @default(100)
+  lastSeenAt      DateTime?
+  freeBytes       BigInt?
+  totalBytes      BigInt?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+  replicas        ObjectReplica[]
+  chunkReplicas   ChunkReplica[]
+  accessLogs      AccessLog[]
+
+  @@index([status, priority])
+}
+
+model ObjectReplica {
+  id               String        @id @default(cuid())
+  versionId        String
+  nodeId           String
+  objectId         String
+  ciphertextSha256 String
+  status           ReplicaStatus @default(PENDING)
+  createdAt        DateTime      @default(now())
+  verifiedAt       DateTime?
+  version          FileVersion   @relation(fields: [versionId], references: [id], onDelete: Cascade)
+  node             StorageNode   @relation(fields: [nodeId], references: [id], onDelete: Cascade)
+
+  @@unique([nodeId, objectId])
+  @@index([versionId, status])
+}
+
+model FileChunk {
+  id                String         @id @default(cuid())
+  versionId         String
+  index             Int
+  plaintextSizeBytes BigInt
+  ciphertextSizeBytes BigInt
+  plaintextSha256   String
+  ciphertextSha256  String
+  encryptionNonce   String?
+  encryptionAuthTag String?
+  createdAt         DateTime       @default(now())
+  version           FileVersion    @relation(fields: [versionId], references: [id], onDelete: Cascade)
+  replicas          ChunkReplica[]
+
+  @@unique([versionId, index])
+  @@index([versionId])
+}
+
+model ChunkReplica {
+  id               String        @id @default(cuid())
+  chunkId          String
+  nodeId           String
+  objectId         String
+  ciphertextSha256 String
+  status           ReplicaStatus @default(PENDING)
+  createdAt        DateTime      @default(now())
+  verifiedAt       DateTime?
+  chunk            FileChunk     @relation(fields: [chunkId], references: [id], onDelete: Cascade)
+  node             StorageNode   @relation(fields: [nodeId], references: [id], onDelete: Cascade)
+
+  @@unique([nodeId, objectId])
+  @@index([chunkId, status])
+  @@index([nodeId, status])
+}
+
+model Permission {
+  id        String          @id @default(cuid())
+  userId    String
+  folderId  String?
+  fileId    String?
+  level     PermissionLevel
+  createdAt DateTime        @default(now())
+  user      User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  folder    Folder?         @relation(fields: [folderId], references: [id], onDelete: Cascade)
+  file      File?           @relation(fields: [fileId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, folderId])
+  @@unique([userId, fileId])
+  @@index([folderId])
+  @@index([fileId])
+}
+
+model ShareLink {
+  id            String      @id @default(cuid())
+  tokenHash     String      @unique
+  tokenEncrypted String?
+  fileId        String?
+  folderId      String?
+  createdById   String
+  passwordHash  String?
+  expiresAt     DateTime?
+  maxDownloads  Int?
+  downloadCount Int         @default(0)
+  status        ShareStatus @default(ACTIVE)
+  createdAt     DateTime    @default(now())
+  lastAccessAt  DateTime?
+  file          File?       @relation(fields: [fileId], references: [id], onDelete: Cascade)
+  folder        Folder?     @relation("FolderShare", fields: [folderId], references: [id], onDelete: Cascade)
+  createdBy     User        @relation("ShareCreator", fields: [createdById], references: [id], onDelete: Cascade)
+  accessLogs    AccessLog[]
+
+  @@index([fileId])
+  @@index([folderId])
+  @@index([status, expiresAt])
+}
+
+model AccessLog {
+  id          String       @id @default(cuid())
+  actorId     String?
+  fileId      String?
+  shareLinkId String?
+  nodeId      String?
+  action      String
+  result      String
+  ip          String?
+  userAgent   String?
+  createdAt   DateTime     @default(now())
+  actor       User?        @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  file        File?        @relation(fields: [fileId], references: [id], onDelete: SetNull)
+  shareLink   ShareLink?   @relation(fields: [shareLinkId], references: [id], onDelete: SetNull)
+  node        StorageNode? @relation(fields: [nodeId], references: [id], onDelete: SetNull)
+
+  @@index([fileId, createdAt])
+  @@index([shareLinkId, createdAt])
+  @@index([actorId, createdAt])
+  @@index([action, createdAt])
+  @@index([result, createdAt])
+}
+
+model BackgroundJob {
+  id          String    @id @default(cuid())
+  type        String
+  status      JobStatus @default(PENDING)
+  payload     Json
+  lastError   String?
+  scheduledAt DateTime  @default(now())
+  startedAt   DateTime?
+  finishedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([type, status, scheduledAt])
+}

@@ -1,0 +1,23 @@
+{
+  "name": "@wangpan/web",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/index.html",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "tsc -p tsconfig.json && vite build",
+    "preview": "vite preview --host 0.0.0.0"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "^4.5.0",
+    "lucide-react": "^0.511.0",
+    "pdfjs-dist": "^5.4.296",
+    "vite": "^6.3.5",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.5",
+    "@types/react-dom": "^19.1.5"
+  }
+}

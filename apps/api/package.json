@@ -1,0 +1,31 @@
+{
+  "name": "@wangpan/api",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "prisma generate && tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "db:migrate": "prisma migrate deploy",
+    "db:dev": "prisma migrate dev",
+    "prisma:generate": "prisma generate",
+    "test": "tsx --test src/**/*.test.ts"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^11.0.2",
+    "@fastify/cors": "^11.0.1",
+    "@fastify/multipart": "^9.0.3",
+    "@prisma/client": "^6.8.2",
+    "@wangpan/shared": "0.1.0",
+    "@wangpan/storage-driver": "0.1.0",
+    "argon2": "^0.43.0",
+    "fastify": "^5.3.3",
+    "zod": "^3.25.28",
+    "archiver": "^7.0.1"
+  },
+  "devDependencies": {
+    "prisma": "^6.8.2"
+  }
+}
