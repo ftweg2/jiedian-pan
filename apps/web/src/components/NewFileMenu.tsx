@@ -68,21 +68,7 @@ export function NewFileMenu({
         <FilePlus size={14} /> 新建文件 <ChevronDown size={12} />
       </button>
       {open && (
-        <div
-          role="menu"
-          style={{
-            position: "absolute",
-            top: "calc(100% + 4px)",
-            left: 0,
-            minWidth: 200,
-            background: "var(--bg-elev)",
-            border: "1px solid var(--border)",
-            borderRadius: 8,
-            boxShadow: "0 8px 24px rgba(0,0,0,0.12)",
-            padding: 4,
-            zIndex: 50
-          }}
-        >
+        <div role="menu" className="new-file-menu">
           <MenuItem icon={<FileText size={14} />} label="文本文件 (.txt)" hint="纯文本笔记" onClick={() => create("txt")} />
           <MenuItem icon={<FileText size={14} />} label="Markdown (.md)" hint="带格式 + 实时预览" onClick={() => create("md")} />
           <MenuItem icon={<FileText size={14} />} label="Word 文档 (.docx)" hint="Phase B 后支持在线编辑" onClick={() => create("docx")} />
@@ -94,27 +80,8 @@ export function NewFileMenu({
 
 function MenuItem({ icon, label, hint, onClick }: { icon: React.ReactNode; label: string; hint?: string; onClick: () => void }) {
   return (
-    <button
-      type="button"
-      role="menuitem"
-      onClick={onClick}
-      style={{
-        width: "100%",
-        textAlign: "left",
-        padding: "8px 10px",
-        background: "transparent",
-        border: "none",
-        borderRadius: 6,
-        cursor: "pointer",
-        display: "flex",
-        gap: 10,
-        alignItems: "center",
-        fontSize: 13
-      }}
-      onMouseEnter={(e) => { (e.currentTarget.style.background = "var(--bg-hover)"); }}
-      onMouseLeave={(e) => { (e.currentTarget.style.background = "transparent"); }}
-    >
-      <span style={{ color: "var(--brand)" }}>{icon}</span>
+    <button type="button" role="menuitem" className="new-file-menu-item" onClick={onClick}>
+      <span className="new-file-menu-icon">{icon}</span>
       <span style={{ flex: 1 }}>
         <div>{label}</div>
         {hint && <div className="muted" style={{ fontSize: 11 }}>{hint}</div>}
