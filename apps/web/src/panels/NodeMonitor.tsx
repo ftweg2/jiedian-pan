@@ -1,6 +1,7 @@
-import { Activity, ArrowLeft, ChevronDown, RefreshCw } from "lucide-react";
+import { Activity, AlertTriangle, ArrowLeft, ChevronDown, RefreshCw } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { api, type NodeItem } from "../api.js";
+import { Dialog } from "../components/Dialog.js";
 import { formatBytes, formatDateTime, nodeStatusLabel } from "../lib/format.js";
 
 type Range = "1h" | "6h" | "24h" | "7d" | "30d";
@@ -154,7 +155,151 @@ export function NodeMonitorView({
         </div>
         <ChevronDown size={14} className="muted" style={{ transform: "rotate(-90deg)" }} />
       </section>
+
+      {/* Decommission section */}
+      <DecommissionSection node={node} toastError={toastError} onChanged={() => load(range)} />
     </div>
+  );
+}
+
+// ---- decommission UI ----
+
+function DecommissionSection({
+  node,
+  toastError,
+  onChanged
+}: {
+  node: NodeItem;
+  toastError: (m: string) => void;
+  onChanged: () => Promise<void> | void;
+}) {
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [migration, setMigration] = useState<{ remaining: number; isDecommissioning: boolean; isDrained: boolean } | null>(null);
+
+  // Poll migration progress every 5s when this node is DECOMMISSIONING or DISABLED.
+  useEffect(() => {
+    let cancelled = false;
+    async function poll() {
+      try {
+        const res = await api<{ remaining: number; isDecommissioning: boolean; isDrained: boolean }>(`/nodes/${node.id}/migration`);
+        if (!cancelled) setMigration(res);
+      } catch {
+        // ignore
+      }
+    }
+    void poll();
+    const t = setInterval(poll, 5000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, [node.id]);
+
+  async function startDecommission() {
+    setBusy(true);
+    try {
+      await api(`/nodes/${node.id}/decommission`, { method: "POST", body: "{}" });
+      setConfirmOpen(false);
+      await onChanged();
+    } catch (err) {
+      toastError(err instanceof Error ? err.message : "下线失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function cancel() {
+    setBusy(true);
+    try {
+      await api(`/nodes/${node.id}/cancel-decommission`, { method: "POST", body: "{}" });
+      await onChanged();
+    } catch (err) {
+      toastError(err instanceof Error ? err.message : "取消下线失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const used = Number((node.totalBytes ?? 0)) - Number((node.freeBytes ?? 0));
+
+  if (node.status === "decommissioning") {
+    return (
+      <section className="card card-pad stack-sm" style={{ borderColor: "var(--warn)" }}>
+        <div className="row" style={{ gap: 8 }}>
+          <Activity size={16} color="var(--warn)" />
+          <strong style={{ fontSize: 13 }}>正在下线 — 后台搬运中</strong>
+        </div>
+        <p className="muted" style={{ fontSize: 12 }}>
+          {migration
+            ? migration.isDrained
+              ? "全部数据已迁出,节点已停用,可在节点列表里删除该节点。"
+              : `还剩 ${migration.remaining} 个副本待搬运到其他节点。每 60s 后台搬一批。`
+            : "加载进度中..."}
+        </p>
+        <div className="row" style={{ gap: 6 }}>
+          <button type="button" className="btn btn-ghost btn-sm" onClick={cancel} disabled={busy || migration?.isDrained}>
+            取消下线(恢复为 active)
+          </button>
+        </div>
+      </section>
+    );
+  }
+
+  if (node.status === "disabled") {
+    return (
+      <section className="card card-pad stack-sm">
+        <p className="muted" style={{ fontSize: 12 }}>节点已停用,不再参与读写。</p>
+      </section>
+    );
+  }
+
+  return (
+    <section className="card card-pad stack-sm" style={{ borderColor: "var(--danger)", background: "color-mix(in srgb, var(--danger-soft) 30%, transparent)" }}>
+      <div className="row" style={{ gap: 8 }}>
+        <AlertTriangle size={16} color="var(--danger)" />
+        <strong style={{ fontSize: 13, color: "var(--danger)" }}>危险区域</strong>
+      </div>
+      <p className="muted" style={{ fontSize: 12, lineHeight: 1.6 }}>
+        <strong>下线节点</strong>会停止新写入,后台把节点上 {formatBytes(used)} 数据搬到其他节点。
+        每 60 秒搬一批(由 <code>DECOMMISSION_CHUNKS_PER_TICK</code> 控制,默认 50)。
+        全部搬完后节点自动转为停用,你可以放心删除节点 / 不续费 VPS。
+      </p>
+      <button
+        type="button"
+        className="btn btn-danger btn-sm"
+        onClick={() => setConfirmOpen(true)}
+        disabled={busy}
+        style={{ alignSelf: "flex-start" }}
+      >
+        <AlertTriangle size={12} /> 下线节点
+      </button>
+      {confirmOpen && (
+        <Dialog
+          title="确认下线节点"
+          icon={<AlertTriangle size={16} style={{ color: "var(--danger)", marginRight: 8 }} />}
+          onClose={() => !busy && setConfirmOpen(false)}
+          footer={
+            <>
+              <button type="button" className="btn btn-ghost" onClick={() => setConfirmOpen(false)} disabled={busy}>取消</button>
+              <button type="button" className="btn btn-danger" onClick={startDecommission} disabled={busy}>
+                {busy && <span className="spinner" />} 我确认,开始下线
+              </button>
+            </>
+          }
+        >
+          <div className="stack-sm">
+            <p>即将下线节点 <strong>{node.name}</strong>。</p>
+            <ul style={{ paddingLeft: 18, fontSize: 13, lineHeight: 1.8 }}>
+              <li>立即停止新写入到此节点</li>
+              <li>后台开始把 <strong>{formatBytes(used)}</strong> 数据迁移到其他节点</li>
+              <li>整个迁移过程是<strong>异步</strong>的,你可以随时关闭此页面</li>
+              <li>取消下线可恢复(只要还没全部迁完)</li>
+              <li>所有数据安全到位之后,节点状态会自动变成「已停用」</li>
+            </ul>
+            <div className="alert alert-warn" style={{ marginTop: 8 }}>
+              确认其他节点剩余容量 ≥ {formatBytes(used)},否则迁移会卡住。
+            </div>
+          </div>
+        </Dialog>
+      )}
+    </section>
   );
 }
 

@@ -7,6 +7,7 @@ import multipart from "@fastify/multipart";
 import {
   FileStatus,
   FileVersionStorageLayout,
+  ReplicaStatus,
   ShareStatus,
   StorageNodeStatus,
   UserRole,
@@ -1852,6 +1853,108 @@ export async function buildServer(env: ApiEnv, prisma: PrismaClient) {
       buckets,
       summary
     };
+  });
+
+  // ===== Node decommissioning (graceful migration off) =====
+  //
+  //   POST /nodes/:id/decommission         → start drain
+  //   GET  /nodes/:id/migration            → progress { total, migrated, remaining, ... }
+  //   POST /nodes/:id/cancel-decommission  → restore ACTIVE
+  //
+  // While DECOMMISSIONING: no new writes hit this node; the background
+  // migrator (in cleanup.ts) copies chunk replicas elsewhere and removes
+  // them from this node. When clean, status auto-flips to DISABLED.
+
+  app.post<{ Params: { id: string } }>("/nodes/:id/decommission", async (request, reply) => {
+    const user = await requireAdmin(prisma, request, reply);
+    if (!user) return;
+
+    const node = await prisma.storageNode.findUnique({ where: { id: request.params.id } });
+    if (!node) return reply.code(404).send({ error: "node not found" });
+    if (node.status === StorageNodeStatus.DECOMMISSIONING) {
+      return { node: serializeNode(node), already: true };
+    }
+    if (node.status === StorageNodeStatus.DISABLED) {
+      return reply.code(409).send({ error: "node already disabled" });
+    }
+
+    // Safety check 1: there must be at least one OTHER non-disabled, non-decommissioning
+    // node to migrate to.
+    const remainingActive = await prisma.storageNode.count({
+      where: {
+        id: { not: node.id },
+        status: { in: [StorageNodeStatus.ACTIVE, StorageNodeStatus.DEGRADED] }
+      }
+    });
+    if (remainingActive === 0) {
+      return reply.code(409).send({
+        error: "cannot decommission the only active node — add another node first"
+      });
+    }
+
+    // Safety check 2: combined free space of remaining active nodes ≥ this node's used bytes
+    const others = await prisma.storageNode.findMany({
+      where: {
+        id: { not: node.id },
+        status: { in: [StorageNodeStatus.ACTIVE, StorageNodeStatus.DEGRADED] }
+      },
+      select: { freeBytes: true }
+    });
+    const remainingFree = others.reduce((sum, n) => sum + (n.freeBytes ?? 0n), 0n);
+    const thisUsed = (node.totalBytes ?? 0n) - (node.freeBytes ?? 0n);
+    if (remainingFree < thisUsed) {
+      return reply.code(409).send({
+        error: `not enough free space on other nodes to absorb this one (need ${thisUsed}B, have ${remainingFree}B)`
+      });
+    }
+
+    const updated = await prisma.storageNode.update({
+      where: { id: node.id },
+      data: { status: StorageNodeStatus.DECOMMISSIONING }
+    });
+    return { node: serializeNode(updated), already: false };
+  });
+
+  app.get<{ Params: { id: string } }>("/nodes/:id/migration", async (request, reply) => {
+    const user = await requireAdmin(prisma, request, reply);
+    if (!user) return;
+
+    const node = await prisma.storageNode.findUnique({ where: { id: request.params.id } });
+    if (!node) return reply.code(404).send({ error: "node not found" });
+
+    const [chunkReplicasOnNode, objectReplicasOnNode] = await Promise.all([
+      prisma.chunkReplica.count({
+        where: { nodeId: node.id, status: { not: ReplicaStatus.DELETED } }
+      }),
+      prisma.objectReplica.count({
+        where: { nodeId: node.id, status: { not: ReplicaStatus.DELETED } }
+      })
+    ]);
+    const remaining = chunkReplicasOnNode + objectReplicasOnNode;
+
+    return {
+      node: { id: node.id, name: node.name, status: node.status.toLowerCase() },
+      remaining,
+      isDecommissioning: node.status === StorageNodeStatus.DECOMMISSIONING,
+      isDrained: node.status === StorageNodeStatus.DECOMMISSIONING && remaining === 0
+    };
+  });
+
+  app.post<{ Params: { id: string } }>("/nodes/:id/cancel-decommission", async (request, reply) => {
+    const user = await requireAdmin(prisma, request, reply);
+    if (!user) return;
+
+    const node = await prisma.storageNode.findUnique({ where: { id: request.params.id } });
+    if (!node) return reply.code(404).send({ error: "node not found" });
+    if (node.status !== StorageNodeStatus.DECOMMISSIONING) {
+      return reply.code(409).send({ error: "node is not in DECOMMISSIONING state" });
+    }
+
+    const restored = await prisma.storageNode.update({
+      where: { id: node.id },
+      data: { status: StorageNodeStatus.ACTIVE }
+    });
+    return { node: serializeNode(restored) };
   });
 
   app.get("/access-logs", async (request, reply) => {

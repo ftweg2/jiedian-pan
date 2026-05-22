@@ -42,7 +42,7 @@ export interface NodeItem {
   id: string;
   name: string;
   baseUrl: string;
-  status: "active" | "degraded" | "offline" | "disabled";
+  status: "active" | "degraded" | "offline" | "decommissioning" | "disabled";
   priority: number;
   lastSeenAt: string | null;
   freeBytes: string | null;

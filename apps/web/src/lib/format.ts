@@ -36,7 +36,14 @@ export function policyDescription(policy: StoragePolicy): string {
 }
 
 export function nodeStatusLabel(status: NodeItem["status"]): string {
-  return { active: "正常", degraded: "降级", offline: "离线", disabled: "停用" }[status];
+  const map: Record<string, string> = {
+    active: "正常",
+    degraded: "降级",
+    offline: "离线",
+    decommissioning: "下线中",
+    disabled: "停用"
+  };
+  return map[status] ?? status;
 }
 
 export function fileStatusLabel(status: FileItem["status"]): string {

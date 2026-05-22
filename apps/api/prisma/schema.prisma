@@ -40,10 +40,11 @@ enum ReplicaStatus {
 }
 
 enum StorageNodeStatus {
-  ACTIVE   @map("active")
-  DEGRADED @map("degraded")
-  OFFLINE  @map("offline")
-  DISABLED @map("disabled")
+  ACTIVE          @map("active")
+  DEGRADED        @map("degraded")
+  OFFLINE         @map("offline")
+  DECOMMISSIONING @map("decommissioning")
+  DISABLED        @map("disabled")
 }
 
 enum ShareStatus {

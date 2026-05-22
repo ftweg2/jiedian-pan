@@ -96,7 +96,11 @@ export function NodesPanel({
           const used = Math.max(total - free, 0);
           const usagePct = total > 0 ? Math.min(100, (used / total) * 100) : 0;
           const barTone = usagePct >= 90 ? "is-danger" : usagePct >= 70 ? "is-warn" : "";
-          const tone = node.status === "active" ? "good" : node.status === "offline" ? "danger" : node.status === "degraded" ? "warn" : "neutral";
+          const tone = node.status === "active" ? "good"
+            : node.status === "offline" ? "danger"
+            : node.status === "degraded" ? "warn"
+            : node.status === "decommissioning" ? "warn"
+            : "neutral";
           return (
             <div key={node.id} className="card card-pad stack-sm">
               <div className="row-between">

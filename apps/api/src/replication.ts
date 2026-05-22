@@ -1064,7 +1064,7 @@ async function selectWritableNodeCount(
   }
 
   const candidates = await prisma.storageNode.findMany({
-    where: { status: { not: StorageNodeStatus.DISABLED } },
+    where: { status: { in: [StorageNodeStatus.ACTIVE, StorageNodeStatus.DEGRADED, StorageNodeStatus.OFFLINE] } },
     orderBy: [{ priority: "asc" }, { createdAt: "asc" }]
   });
 
@@ -1120,8 +1120,9 @@ function hasCapacity(node: StorageNode, objectSizeBytes: number, reservedBytes: 
  * OFFLINE and excluded.
  */
 async function refreshActiveNodesOnce(prisma: PrismaClient): Promise<StorageNode[]> {
+  // Planner skips DISABLED (never write) and DECOMMISSIONING (draining, no new writes).
   const candidates = await prisma.storageNode.findMany({
-    where: { status: { not: StorageNodeStatus.DISABLED } },
+    where: { status: { in: [StorageNodeStatus.ACTIVE, StorageNodeStatus.DEGRADED, StorageNodeStatus.OFFLINE] } },
     orderBy: [{ priority: "asc" }, { createdAt: "asc" }]
   });
   const active: StorageNode[] = [];
