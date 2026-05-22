@@ -1420,12 +1420,13 @@ button:focus-visible, .btn:focus-visible, .input:focus-visible,
 /* ---- Text/Markdown editor (Phase A) ---- */
 .text-editor-overlay {
   position: fixed; inset: 0; z-index: 1000;
-  background: rgba(0,0,0,0.45);
+  background: rgba(0,0,0,0.55);
   display: flex; align-items: stretch; justify-content: stretch;
 }
 .text-editor-window {
   flex: 1; margin: 24px;
-  background: var(--bg);
+  background: #ffffff;
+  color: #1f2937;
   border-radius: 12px;
   display: flex; flex-direction: column;
   overflow: hidden;
@@ -1434,12 +1435,12 @@ button:focus-visible, .btn:focus-visible, .input:focus-visible,
 .text-editor-titlebar {
   display: flex; align-items: center; gap: 12px;
   padding: 10px 14px;
-  border-bottom: 1px solid var(--border);
-  background: var(--bg-elev);
+  border-bottom: 1px solid rgba(0,0,0,0.08);
+  background: #f9fafb;
 }
 .text-editor-body { flex: 1; overflow: hidden; display: flex; }
 .text-editor-panes { flex: 1; display: flex; min-height: 0; }
-.text-editor-panes.is-split > .text-editor-textarea { width: 50%; border-right: 1px solid var(--border); }
+.text-editor-panes.is-split > .text-editor-textarea { width: 50%; border-right: 1px solid rgba(0,0,0,0.08); }
 .text-editor-panes.is-split > .text-editor-preview { width: 50%; }
 .text-editor-textarea {
   flex: 1; min-height: 0;
@@ -1448,14 +1449,17 @@ button:focus-visible, .btn:focus-visible, .input:focus-visible,
   border: none; outline: none; resize: none;
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   font-size: 14px; line-height: 1.6;
-  background: var(--bg);
-  color: var(--fg);
+  background: #ffffff;
+  color: #1f2937;
+  caret-color: #2bbf6b;
 }
+.text-editor-textarea::placeholder { color: #9ca3af; }
 .text-editor-preview {
   flex: 1; min-height: 0;
   overflow: auto;
   padding: 16px 24px;
-  background: var(--bg-elev);
+  background: #f9fafb;
+  color: #1f2937;
   font-size: 14px; line-height: 1.65;
 }
 .text-editor-preview h1 { font-size: 22px; margin: 0 0 12px; }
@@ -1463,11 +1467,11 @@ button:focus-visible, .btn:focus-visible, .input:focus-visible,
 .text-editor-preview h3 { font-size: 15px; margin: 14px 0 8px; }
 .text-editor-preview p { margin: 0 0 10px; }
 .text-editor-preview ul, .text-editor-preview ol { padding-left: 22px; margin: 0 0 10px; }
-.text-editor-preview code { background: var(--bg-hover); padding: 1px 5px; border-radius: 3px; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.9em; }
-.text-editor-preview pre { background: var(--bg-hover); padding: 10px 12px; border-radius: 6px; overflow-x: auto; }
+.text-editor-preview code { background: rgba(0,0,0,0.06); padding: 1px 5px; border-radius: 3px; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.9em; }
+.text-editor-preview pre { background: rgba(0,0,0,0.06); padding: 10px 12px; border-radius: 6px; overflow-x: auto; }
 .text-editor-preview pre code { background: transparent; padding: 0; }
-.text-editor-preview blockquote { border-left: 3px solid var(--border-strong); margin: 0 0 10px; padding: 4px 12px; color: var(--fg-subtle); }
-.text-editor-preview a { color: var(--brand); }
+.text-editor-preview blockquote { border-left: 3px solid rgba(0,0,0,0.2); margin: 0 0 10px; padding: 4px 12px; color: #6b7280; }
+.text-editor-preview a { color: #2bbf6b; }
 .text-editor-preview hr { border: none; border-top: 1px solid var(--border); margin: 16px 0; }
 
 /* ---- New-file dropdown ---- */
