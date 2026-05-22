@@ -581,6 +581,75 @@ export async function buildServer(env: ApiEnv, prisma: PrismaClient) {
     };
   });
 
+  // POST /files/new — create a new file with provided content (or a built-in
+  // template for docx). Used by the "新建文件" UI menu and any future
+  // "create-from-content" callers. Body:
+  //   { name: string, mimeType: string, folderId?: string|null,
+  //     contentBase64?: string }
+  // If contentBase64 is omitted:
+  //   - txt / md / json → empty file
+  //   - docx → minimal valid empty .docx (so Word/ONLYOFFICE can open it)
+  app.post("/files/new", async (request, reply) => {
+    const user = await requireUser(prisma, request, reply);
+    if (!user) return;
+
+    const body = newFileSchema.parse(request.body);
+    const content = await resolveNewFileContent(body);
+    const folder = await resolveWritableUploadFolder(prisma, user, body.folderId ?? null);
+    const folderDefault = folder ? toSharedPolicy(folder.defaultPolicy) : "standard";
+    const policy = folderDefault;
+
+    const file = await createFileFromBuffer(prisma, env, user, {
+      name: body.name,
+      mimeType: body.mimeType,
+      folderId: folder?.id ?? null,
+      content,
+      policy
+    });
+    return reply.code(201).send({ file: serializeFile(file) });
+  });
+
+  // PUT /files/:id/content — overwrite a file's content with a new version.
+  // Used by the in-browser txt/md editor's save action. Body is the raw bytes
+  // (we accept JSON {contentBase64} for simplicity; small files only).
+  // Streams a new FileVersion onto the same File row, so download history /
+  // shares keep working.
+  app.put<{ Params: { id: string } }>("/files/:id/content", async (request, reply) => {
+    const user = await requireUser(prisma, request, reply);
+    if (!user) return;
+
+    const file = await prisma.file.findUnique({ where: { id: request.params.id }, include: { folder: true } });
+    if (!file || file.status === FileStatus.DELETED) return reply.code(404).send({ error: "file not found" });
+    if (file.status === FileStatus.TRASHED) return reply.code(409).send({ error: "file is in trash" });
+    if (!(await canAccessFile(prisma, user, file, "write"))) {
+      return reply.code(403).send({ error: "no write permission" });
+    }
+
+    const body = saveContentSchema.parse(request.body);
+    const content = Buffer.from(body.contentBase64, "base64");
+    if (content.byteLength > env.maxUploadBytes) {
+      return reply.code(413).send({ error: "content too large" });
+    }
+
+    const folderDefault = file.folder ? toSharedPolicy(file.folder.defaultPolicy) : "standard";
+    const policy = resolveStoragePolicy(folderDefault, file.policyOverride ? toSharedPolicy(file.policyOverride) : null);
+
+    await replaceFileContent(prisma, env, file.id, content, policy);
+
+    const updated = await prisma.file.findUnique({
+      where: { id: file.id },
+      include: {
+        folder: true,
+        versions: {
+          orderBy: { createdAt: "desc" },
+          take: 1,
+          include: { replicas: true, chunks: { include: { replicas: true } } }
+        }
+      }
+    });
+    return { file: serializeFile(updated!) };
+  });
+
   app.post("/files/upload", async (request, reply) => {
     const user = await requireUser(prisma, request, reply);
     if (!user) return;
@@ -2219,6 +2288,32 @@ const shareDownloadSchema = z.object({
   password: z.string().optional()
 });
 
+// Allowed mime types for POST /files/new. Whitelist so we don't accept arbitrary
+// "create empty file" requests with unsupported types — the editor frontend
+// only knows how to handle these three.
+const NEW_FILE_MIME_WHITELIST = new Set([
+  "text/plain",
+  "text/markdown",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+]);
+
+const newFileSchema = z.object({
+  name: z.string().min(1).max(255),
+  mimeType: z.string().refine((v) => NEW_FILE_MIME_WHITELIST.has(v), {
+    message: "unsupported mime; expected text/plain | text/markdown | docx"
+  }),
+  folderId: z.string().nullable().optional(),
+  // Optional. If omitted we generate sensible defaults (empty for text,
+  // minimal valid template for docx).
+  contentBase64: z.string().optional()
+});
+
+// PUT /files/:id/content body. Small files only — anything bigger should
+// keep using the chunked upload endpoints.
+const saveContentSchema = z.object({
+  contentBase64: z.string()
+});
+
 const createNodeSchema = z.object({
   name: z.string().min(1),
   baseUrl: z.string().url(),
@@ -3649,4 +3744,191 @@ function nodeHealthErrorMessage(error: unknown): string {
   }
 
   return message || "storage-agent health check failed";
+}
+
+// =========================================================================
+// New-file / save-content helpers (Phase A: in-browser editor)
+// =========================================================================
+
+/**
+ * Build the initial bytes for a new file. For text/markdown we use the
+ * provided content (or empty bytes). For docx we synthesize a minimal valid
+ * empty .docx so that Word / ONLYOFFICE will open it without complaining.
+ *
+ * docx is a ZIP with three required entries:
+ *   - [Content_Types].xml
+ *   - _rels/.rels
+ *   - word/document.xml
+ * We use `archiver` (already a dep) to build it.
+ */
+async function resolveNewFileContent(body: z.infer<typeof newFileSchema>): Promise<Buffer> {
+  if (body.contentBase64 != null) {
+    return Buffer.from(body.contentBase64, "base64");
+  }
+  if (body.mimeType === "text/plain" || body.mimeType === "text/markdown") {
+    return Buffer.alloc(0);
+  }
+  if (body.mimeType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") {
+    return buildEmptyDocx();
+  }
+  return Buffer.alloc(0);
+}
+
+async function buildEmptyDocx(): Promise<Buffer> {
+  const archiverLib = await import("archiver");
+  const archive = archiverLib.default("zip", { zlib: { level: 0 } });
+  const chunks: Buffer[] = [];
+  archive.on("data", (chunk: Buffer) => chunks.push(chunk));
+  const done = new Promise<void>((resolve, reject) => {
+    archive.on("end", () => resolve());
+    archive.on("error", (err) => reject(err));
+  });
+
+  const contentTypes = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>`;
+  const rels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>`;
+  const document = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p/>
+    <w:sectPr/>
+  </w:body>
+</w:document>`;
+
+  archive.append(contentTypes, { name: "[Content_Types].xml" });
+  archive.append(rels, { name: "_rels/.rels" });
+  archive.append(document, { name: "word/document.xml" });
+  await archive.finalize();
+  await done;
+  return Buffer.concat(chunks);
+}
+
+/**
+ * Create a new File row + initial FileVersion, with the given content
+ * encrypted + chunked + replicated. Same plumbing as POST /files/upload,
+ * just sourced from an in-memory buffer instead of a multipart stream.
+ */
+async function createFileFromBuffer(
+  prisma: PrismaClient,
+  env: ApiEnv,
+  user: { id: string },
+  args: {
+    name: string;
+    mimeType: string;
+    folderId: string | null;
+    content: Buffer;
+    policy: StoragePolicy;
+  }
+) {
+  const stager = await createStreamingChunkUploadStager(prisma, args.policy, CHUNK_SIZE_BYTES);
+  const encrypted = await encryptStreamToChunks(
+    bufferAsAsyncIterable(args.content),
+    env.masterKey,
+    CHUNK_SIZE_BYTES,
+    stager.stageChunk,
+    { maxPlaintextSizeBytes: env.maxUploadBytes }
+  );
+  await stager.ensureReplicaPolicy(args.policy);
+  const stagedUpload = stager.finish();
+
+  const file = await prisma.file.create({
+    data: {
+      name: args.name,
+      mimeType: args.mimeType,
+      sizeBytes: BigInt(encrypted.plaintextSizeBytes),
+      ownerId: user.id,
+      folderId: args.folderId,
+      status: FileStatus.PENDING
+    }
+  });
+
+  const version = await prisma.fileVersion.create({
+    data: {
+      fileId: file.id,
+      objectKey: `${file.id}/v1`,
+      plaintextSha256: encrypted.metadata.plaintextSha256,
+      ciphertextSha256: encrypted.metadata.ciphertextSha256,
+      encryptionNonce: encrypted.metadata.encryptionNonce,
+      encryptionAuthTag: encrypted.metadata.encryptionAuthTag,
+      wrappedKey: encrypted.metadata.wrappedKey,
+      sizeBytes: BigInt(encrypted.ciphertextSizeBytes),
+      storageLayout: FileVersionStorageLayout.CHUNKED,
+      chunkSizeBytes: BigInt(encrypted.chunkSizeBytes),
+      chunkCount: encrypted.chunkCount
+    }
+  });
+  await persistStagedChunkMetadata(prisma, version.id, stagedUpload);
+
+  return prisma.file.update({
+    where: { id: file.id },
+    data: { status: FileStatus.ACTIVE },
+    include: {
+      folder: true,
+      versions: {
+        orderBy: { createdAt: "desc" },
+        take: 1,
+        include: { replicas: true, chunks: { include: { replicas: true } } }
+      }
+    }
+  });
+}
+
+/**
+ * Replace a file's content: add a new FileVersion onto the existing File row
+ * and the same encrypt/chunk/replicate flow. Old versions remain in the DB
+ * so version history works.
+ */
+async function replaceFileContent(
+  prisma: PrismaClient,
+  env: ApiEnv,
+  fileId: string,
+  content: Buffer,
+  policy: StoragePolicy
+): Promise<void> {
+  const stager = await createStreamingChunkUploadStager(prisma, policy, CHUNK_SIZE_BYTES);
+  const encrypted = await encryptStreamToChunks(
+    bufferAsAsyncIterable(content),
+    env.masterKey,
+    CHUNK_SIZE_BYTES,
+    stager.stageChunk,
+    { maxPlaintextSizeBytes: env.maxUploadBytes }
+  );
+  await stager.ensureReplicaPolicy(policy);
+  const stagedUpload = stager.finish();
+
+  // Count existing versions so we can mint a unique objectKey suffix.
+  const existing = await prisma.fileVersion.count({ where: { fileId } });
+  const version = await prisma.fileVersion.create({
+    data: {
+      fileId,
+      objectKey: `${fileId}/v${existing + 1}`,
+      plaintextSha256: encrypted.metadata.plaintextSha256,
+      ciphertextSha256: encrypted.metadata.ciphertextSha256,
+      encryptionNonce: encrypted.metadata.encryptionNonce,
+      encryptionAuthTag: encrypted.metadata.encryptionAuthTag,
+      wrappedKey: encrypted.metadata.wrappedKey,
+      sizeBytes: BigInt(encrypted.ciphertextSizeBytes),
+      storageLayout: FileVersionStorageLayout.CHUNKED,
+      chunkSizeBytes: BigInt(encrypted.chunkSizeBytes),
+      chunkCount: encrypted.chunkCount
+    }
+  });
+  await persistStagedChunkMetadata(prisma, version.id, stagedUpload);
+
+  // Update File.sizeBytes to reflect new latest version.
+  await prisma.file.update({
+    where: { id: fileId },
+    data: { sizeBytes: BigInt(encrypted.plaintextSizeBytes), updatedAt: new Date() }
+  });
+}
+
+async function* bufferAsAsyncIterable(buf: Buffer): AsyncIterable<Buffer> {
+  yield buf;
 }

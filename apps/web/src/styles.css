@@ -1416,3 +1416,56 @@ button:focus-visible, .btn:focus-visible, .input:focus-visible,
   .folder-share-breadcrumb { padding: 8px 16px; }
   .folder-share-body .table-wrap { margin: 0 16px !important; }
 }
+
+/* ---- Text/Markdown editor (Phase A) ---- */
+.text-editor-overlay {
+  position: fixed; inset: 0; z-index: 1000;
+  background: rgba(0,0,0,0.45);
+  display: flex; align-items: stretch; justify-content: stretch;
+}
+.text-editor-window {
+  flex: 1; margin: 24px;
+  background: var(--bg);
+  border-radius: 12px;
+  display: flex; flex-direction: column;
+  overflow: hidden;
+  box-shadow: 0 12px 36px rgba(0,0,0,0.25);
+}
+.text-editor-titlebar {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elev);
+}
+.text-editor-body { flex: 1; overflow: hidden; display: flex; }
+.text-editor-panes { flex: 1; display: flex; min-height: 0; }
+.text-editor-panes.is-split > .text-editor-textarea { width: 50%; border-right: 1px solid var(--border); }
+.text-editor-panes.is-split > .text-editor-preview { width: 50%; }
+.text-editor-textarea {
+  flex: 1; min-height: 0;
+  width: 100%;
+  padding: 16px 20px;
+  border: none; outline: none; resize: none;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 14px; line-height: 1.6;
+  background: var(--bg);
+  color: var(--fg);
+}
+.text-editor-preview {
+  flex: 1; min-height: 0;
+  overflow: auto;
+  padding: 16px 24px;
+  background: var(--bg-elev);
+  font-size: 14px; line-height: 1.65;
+}
+.text-editor-preview h1 { font-size: 22px; margin: 0 0 12px; }
+.text-editor-preview h2 { font-size: 18px; margin: 18px 0 10px; }
+.text-editor-preview h3 { font-size: 15px; margin: 14px 0 8px; }
+.text-editor-preview p { margin: 0 0 10px; }
+.text-editor-preview ul, .text-editor-preview ol { padding-left: 22px; margin: 0 0 10px; }
+.text-editor-preview code { background: var(--bg-hover); padding: 1px 5px; border-radius: 3px; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.9em; }
+.text-editor-preview pre { background: var(--bg-hover); padding: 10px 12px; border-radius: 6px; overflow-x: auto; }
+.text-editor-preview pre code { background: transparent; padding: 0; }
+.text-editor-preview blockquote { border-left: 3px solid var(--border-strong); margin: 0 0 10px; padding: 4px 12px; color: var(--fg-subtle); }
+.text-editor-preview a { color: var(--brand); }
+.text-editor-preview hr { border: none; border-top: 1px solid var(--border); margin: 16px 0; }

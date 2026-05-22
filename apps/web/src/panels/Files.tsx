@@ -37,6 +37,8 @@ import { PreviewDialog } from "../dialogs/Preview.js";
 import { FolderShareDialog, ShareDialog } from "../dialogs/Share.js";
 import { RenameDialog, type RenameTarget } from "../dialogs/Rename.js";
 import { MoveDialog } from "../dialogs/Move.js";
+import { NewFileMenu } from "../components/NewFileMenu.js";
+import { TextFileEditor } from "../dialogs/TextFileEditor.js";
 import {
   compareFiles,
   countCategory,
@@ -98,6 +100,11 @@ export function FilesPanel(props: FilesPanelProps) {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
   const [createFolderOpen, setCreateFolderOpen] = useState(false);
+  // Text editor (txt/md): when set, full-screen editor opens. Driven both by
+  // clicking an existing txt/md/word file in the list AND by 新建文件 menu.
+  const [editingFileId, setEditingFileId] = useState<string | null>(null);
+  const [editingFileName, setEditingFileName] = useState<string>("");
+  const [editingFileMime, setEditingFileMime] = useState<string>("");
   const [shareFile, setShareFile] = useState<FileItem | null>(null);
   const [shareFolder, setShareFolder] = useState<FolderItem | null>(null);
   const [renameTarget, setRenameTarget] = useState<RenameTarget | null>(null);
@@ -252,8 +259,17 @@ export function FilesPanel(props: FilesPanelProps) {
   }
 
   function activate(item: BrowserItem) {
-    if (item.kind === "folder") openFolder(item.folder);
-    else setPreviewFile(item.file);
+    if (item.kind === "folder") return openFolder(item.folder);
+    // txt / md / docx → open the in-browser editor instead of the preview.
+    // (docx still falls back to a download CTA inside the editor until
+    // Phase B ONLYOFFICE lands.)
+    if (isEditableFile(item.file)) {
+      setEditingFileId(item.file.id);
+      setEditingFileName(item.file.name);
+      setEditingFileMime(item.file.mimeType);
+      return;
+    }
+    setPreviewFile(item.file);
   }
   function openDetails(item: BrowserItem) {
     if (item.kind === "folder") openFolder(item.folder);
@@ -356,6 +372,17 @@ export function FilesPanel(props: FilesPanelProps) {
           <button type="button" className="btn btn-primary" onClick={onOpenUpload}>
             <UploadCloud size={14} /> 上传
           </button>
+          <NewFileMenu
+            folderId={currentFolderId}
+            onCreated={async (file) => {
+              await reload();
+              // Open editor right away on the new file.
+              setEditingFileId(file.id);
+              setEditingFileName(file.name);
+              setEditingFileMime(file.mimeType);
+            }}
+            toastError={toastError}
+          />
           <button type="button" className="btn btn-secondary" onClick={() => setCreateFolderOpen(true)}>
             <FolderPlus size={14} /> 新建文件夹
           </button>
@@ -590,6 +617,17 @@ export function FilesPanel(props: FilesPanelProps) {
         />
       )}
 
+      {editingFileId && (
+        <TextFileEditor
+          fileId={editingFileId}
+          fileName={editingFileName}
+          mimeType={editingFileMime}
+          onClose={() => setEditingFileId(null)}
+          onSaved={async () => { await reload(); toastSuccess("已保存"); }}
+          toastError={toastError}
+        />
+      )}
+
       {deleteTargets && (
         <ConfirmDialog
           title={`移入回收站`}
@@ -667,4 +705,18 @@ export function FilesPanel(props: FilesPanelProps) {
       )}
     </div>
   );
+}
+
+/**
+ * Returns true if double-clicking this file should open the in-browser editor
+ * instead of the preview dialog. Whitelist by mime + extension fallback so
+ * we don't misroute things like binary blobs with a .txt-ish mime.
+ */
+function isEditableFile(file: FileItem): boolean {
+  const name = file.name.toLowerCase();
+  const mime = (file.mimeType || "").toLowerCase();
+  if (mime === "text/plain" || mime === "text/markdown") return true;
+  if (mime === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") return true;
+  if (name.endsWith(".txt") || name.endsWith(".md") || name.endsWith(".markdown") || name.endsWith(".docx")) return true;
+  return false;
 }
