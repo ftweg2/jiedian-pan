@@ -42,6 +42,7 @@ import { toDbPermission, toDbPolicy, toSharedPolicy } from "./mappers.js";
 import { canAccessFile, canAccessFolder } from "./permissions.js";
 import { kickDrain } from "./cleanup.js";
 import { declareNodeLost } from "./node-prober.js";
+import { AgentStorageDriver } from "@wangpan/storage-driver";
 import {
   CHUNK_SIZE_BYTES,
   chunkedVersionHasPerChunkEncryption,
@@ -2042,6 +2043,95 @@ export async function buildServer(env: ApiEnv, prisma: PrismaClient) {
       node: serializeNode(updated!),
       ...result,
       impact: await computeNodeImpact(prisma, node.id)
+    };
+  });
+
+  // POST /nodes/:id/reverify — for each MISSING replica on this node, ask the
+  // agent if it still has the object (with matching ciphertext SHA). If yes,
+  // flip the replica back to AVAILABLE. Use case: a node was incorrectly
+  // declared LOST (network blip, token mismatch, agent restart), got its
+  // replicas auto-marked MISSING by the self-heal, but the data on disk is
+  // actually fine and just needs re-acceptance.
+  app.post<{ Params: { id: string } }>("/nodes/:id/reverify", async (request, reply) => {
+    const user = await requireAdmin(prisma, request, reply);
+    if (!user) return;
+
+    const node = await prisma.storageNode.findUnique({ where: { id: request.params.id } });
+    if (!node) return reply.code(404).send({ error: "node not found" });
+    if (node.status === StorageNodeStatus.DISABLED) {
+      return reply.code(409).send({ error: "node is disabled" });
+    }
+
+    const driver = new AgentStorageDriver({ baseUrl: node.baseUrl, token: node.agentToken });
+
+    const chunkMissing = await prisma.chunkReplica.findMany({
+      where: { nodeId: node.id, status: ReplicaStatus.MISSING },
+      select: { id: true, objectId: true, ciphertextSha256: true }
+    });
+    const objectMissing = await prisma.objectReplica.findMany({
+      where: { nodeId: node.id, status: ReplicaStatus.MISSING },
+      select: { id: true, objectId: true, ciphertextSha256: true }
+    });
+
+    let chunkRecovered = 0;
+    let chunkStillMissing = 0;
+    let objectRecovered = 0;
+    let objectStillMissing = 0;
+
+    // Verify with bounded concurrency so we don't slam the agent with 500
+    // parallel requests on big nodes. Pool of 6 is a sane default.
+    async function pool<T>(items: T[], width: number, fn: (item: T) => Promise<void>): Promise<void> {
+      let i = 0;
+      const workers = Array.from({ length: Math.min(width, items.length) }, async () => {
+        while (i < items.length) {
+          const idx = i++;
+          await fn(items[idx]).catch(() => undefined);
+        }
+      });
+      await Promise.all(workers);
+    }
+
+    await pool(chunkMissing, 6, async (r) => {
+      try {
+        const v = await driver.verifyObject(r.objectId, r.ciphertextSha256);
+        if (v.exists && v.matches) {
+          await prisma.chunkReplica.update({
+            where: { id: r.id },
+            data: { status: ReplicaStatus.AVAILABLE, verifiedAt: new Date() }
+          });
+          chunkRecovered += 1;
+        } else {
+          chunkStillMissing += 1;
+        }
+      } catch {
+        chunkStillMissing += 1;
+      }
+    });
+
+    await pool(objectMissing, 6, async (r) => {
+      try {
+        const v = await driver.verifyObject(r.objectId, r.ciphertextSha256);
+        if (v.exists && v.matches) {
+          await prisma.objectReplica.update({
+            where: { id: r.id },
+            data: { status: ReplicaStatus.AVAILABLE, verifiedAt: new Date() }
+          });
+          objectRecovered += 1;
+        } else {
+          objectStillMissing += 1;
+        }
+      } catch {
+        objectStillMissing += 1;
+      }
+    });
+
+    return {
+      node: { id: node.id, name: node.name },
+      checked: chunkMissing.length + objectMissing.length,
+      chunkRecovered,
+      chunkStillMissing,
+      objectRecovered,
+      objectStillMissing
     };
   });
 

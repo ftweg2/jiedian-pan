@@ -1030,14 +1030,15 @@ export async function backfillImportantReplicas(prisma: PrismaClient): Promise<n
     }
 
     if (!sourceCiphertext) {
-      await prisma.objectReplica.updateMany({
-        where: {
-          versionId: version.id,
-          status: { notIn: [ReplicaStatus.DELETED, ReplicaStatus.MISSING] }
-        },
-        data: { status: ReplicaStatus.MISSING }
-      });
-      console.warn(`backfill: version ${version.id} has no reachable source — marked MISSING`);
+      // No source was reachable. That doesn't mean the data is gone — it
+      // could just be a transient network/auth issue (we hit this in
+      // production when an agent's token got out of sync). DON'T bulk-mark
+      // replicas MISSING here; that previously caused 73 chunks to become
+      // un-readable just because the API briefly couldn't auth to the
+      // agent. The dedicated reverify pass (POST /nodes/:id/reverify) is
+      // the right place to definitively mark MISSING — it asks each node
+      // directly whether the object still exists.
+      console.warn(`backfill: version ${version.id} has no reachable source this tick — will retry on next maintenance`);
       continue;
     }
 
@@ -1136,16 +1137,12 @@ async function backfillChunkedVersion(
     }
 
     if (!ciphertext || !sourceUsed) {
-      // Genuinely unrecoverable. Mark every non-deleted replica MISSING so the
-      // UI surfaces it via /risks and the file detail "storage" tab.
-      await prisma.chunkReplica.updateMany({
-        where: {
-          chunkId: chunk.id,
-          status: { notIn: [ReplicaStatus.DELETED, ReplicaStatus.MISSING] }
-        },
-        data: { status: ReplicaStatus.MISSING }
-      });
-      console.warn(`backfill: chunk ${chunk.id} has no reachable source — marked MISSING`);
+      // No source reachable this tick. Could be a transient connection /
+      // auth issue rather than real data loss. Don't bulk-mark MISSING
+      // here — that's what burned us when one bad token cascaded into
+      // 73 chunks being marked MISSING. The reverify endpoint is the
+      // authoritative place to mark MISSING; it asks the agent directly.
+      console.warn(`backfill: chunk ${chunk.id} has no reachable source this tick — will retry`);
       continue;
     }
 

@@ -166,7 +166,75 @@ export function NodeMonitorView({
       {node.status !== "lost" && node.status !== "disabled" && node.status !== "decommissioning" && (
         <DeclareLostSection node={node} toastError={toastError} onChanged={() => load(range)} />
       )}
+
+      {/* Manual re-verify: walk MISSING replicas and ask the agent if the
+          data is still there. Useful any time admin suspects a false alarm. */}
+      {node.status !== "disabled" && (
+        <ReverifySection node={node} toastError={toastError} onChanged={() => load(range)} />
+      )}
     </div>
+  );
+}
+
+function ReverifySection({
+  node,
+  toastError,
+  onChanged
+}: {
+  node: NodeItem;
+  toastError: (m: string) => void;
+  onChanged: () => Promise<void> | void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [last, setLast] = useState<{ checked: number; recovered: number } | null>(null);
+
+  async function run() {
+    setBusy(true);
+    try {
+      const res = await api<{ checked: number; chunkRecovered: number; objectRecovered: number }>(
+        `/nodes/${node.id}/reverify`,
+        { method: "POST", body: "{}" }
+      );
+      const recovered = res.chunkRecovered + res.objectRecovered;
+      setLast({ checked: res.checked, recovered });
+      await onChanged();
+      if (res.checked === 0) {
+        toastError("没有可校验的 MISSING 副本(这是好事)");
+      } else {
+        toastError(`已校验 ${res.checked} 个副本,恢复 ${recovered} 个`);
+      }
+    } catch (err) {
+      toastError(err instanceof Error ? err.message : "重新校验失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="card card-pad stack-sm">
+      <div className="row" style={{ gap: 8 }}>
+        <RotateCcw size={16} className="muted" />
+        <strong style={{ fontSize: 13 }}>重新校验副本</strong>
+      </div>
+      <p className="muted" style={{ fontSize: 12, lineHeight: 1.6 }}>
+        如果节点之前被误判失联,或者 token 短暂不一致导致副本被标 MISSING,
+        点这里会逐个去 agent 那边核对:还在 → 翻回正常;真没了 → 保持 MISSING。
+      </p>
+      <button
+        type="button"
+        className="btn btn-ghost btn-sm"
+        onClick={run}
+        disabled={busy}
+        style={{ alignSelf: "flex-start" }}
+      >
+        <RotateCcw size={12} className={busy ? "spin" : ""} /> {busy ? "校验中…" : "立即重新校验"}
+      </button>
+      {last && (
+        <p className="muted" style={{ fontSize: 12, margin: 0 }}>
+          上次结果:校验 {last.checked} 个,恢复 {last.recovered} 个
+        </p>
+      )}
+    </section>
   );
 }
 
@@ -303,8 +371,22 @@ function LostSection({
   async function restore() {
     setBusy(true);
     try {
+      // 1) Flip status back to OFFLINE. Next probe will promote ACTIVE.
       await api(`/nodes/${node.id}/restore`, { method: "POST", body: "{}" });
+      // 2) Walk MISSING replicas and verify on the (presumably-back) agent.
+      //    Anything that still has the bytes flips back to AVAILABLE so
+      //    files become readable again. This is the part that "un-loses"
+      //    files when the LOST declaration turned out to be a false alarm.
+      const result = await api<{ checked: number; chunkRecovered: number; objectRecovered: number }>(
+        `/nodes/${node.id}/reverify`,
+        { method: "POST", body: "{}" }
+      );
       await onChanged();
+      const recovered = result.chunkRecovered + result.objectRecovered;
+      if (recovered > 0) {
+        // We don't have a toastSuccess prop here, but the err toast is fine for info.
+        toastError(`已恢复 ${recovered}/${result.checked} 个副本`);
+      }
     } catch (err) {
       toastError(err instanceof Error ? err.message : "恢复节点失败");
     } finally {
