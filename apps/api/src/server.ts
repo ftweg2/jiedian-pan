@@ -1791,6 +1791,36 @@ export async function buildServer(env: ApiEnv, prisma: PrismaClient) {
     return reply.code(201).send({ node: serializeNode(node) });
   });
 
+  // PATCH /nodes/:id — edit name / baseUrl / agentToken / priority on an
+  // existing node. Use case: agent's AGENT_TOKEN got regenerated (e.g. .env
+  // was overwritten) and the main VPS needs to learn the new value without
+  // delete-and-readd (which would orphan the existing replica rows).
+  app.patch<{ Params: { id: string } }>("/nodes/:id", async (request, reply) => {
+    const user = await requireAdmin(prisma, request, reply);
+    if (!user) return;
+
+    const node = await prisma.storageNode.findUnique({ where: { id: request.params.id } });
+    if (!node) return reply.code(404).send({ error: "node not found" });
+
+    const body = updateNodeSchema.parse(request.body);
+    const updated = await prisma.storageNode.update({
+      where: { id: node.id },
+      data: {
+        ...(body.name !== undefined ? { name: body.name } : {}),
+        ...(body.baseUrl !== undefined ? { baseUrl: body.baseUrl.replace(/\/+$/, "") } : {}),
+        ...(body.agentToken !== undefined ? { agentToken: body.agentToken } : {}),
+        ...(body.priority !== undefined ? { priority: body.priority } : {}),
+        // Touching connectivity-affecting fields (baseUrl/agentToken) wipes the
+        // probe-failure counter so a previously-LOST or OFFLINE node gets a
+        // fresh chance — the next probe round will reflect the new config.
+        ...(body.baseUrl !== undefined || body.agentToken !== undefined
+          ? { consecutiveProbeFailures: 0 }
+          : {})
+      }
+    });
+    return { node: serializeNode(updated) };
+  });
+
   // Node monitoring: returns 60 aggregated buckets covering the requested
   // window + summary stats (current ping, 24h avg, uptime %, etc.).
   app.get<{ Params: { id: string }; Querystring: { range?: string } }>("/nodes/:id/probes", async (request, reply) => {
@@ -2173,6 +2203,16 @@ const createNodeSchema = z.object({
   agentToken: z.string().min(24),
   priority: z.number().int().min(1).max(1000).optional()
 });
+
+// PATCH /nodes/:id — every field is optional; omit a field to leave it alone.
+// agentToken is unset by sending an empty string would be silly, so we keep
+// the min(24) constraint only when present.
+const updateNodeSchema = z.object({
+  name: z.string().min(1).optional(),
+  baseUrl: z.string().url().optional(),
+  agentToken: z.string().min(24).optional(),
+  priority: z.number().int().min(1).max(1000).optional()
+}).refine((body) => Object.keys(body).length > 0, { message: "at least one field is required" });
 
 function clampChunkSize(requested: number): number {
   if (!Number.isFinite(requested) || requested <= 0) return DEFAULT_CHUNK_SIZE;

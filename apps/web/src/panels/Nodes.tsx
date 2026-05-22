@@ -1,4 +1,4 @@
-import { Activity, AlertTriangle, Copy, HardDrive, KeyRound, Plus, RefreshCw } from "lucide-react";
+import { Activity, AlertTriangle, Copy, HardDrive, KeyRound, Pencil, Plus, RefreshCw } from "lucide-react";
 import { useState, type FormEvent } from "react";
 import { api, type NodeItem } from "../api.js";
 import { Dialog } from "../components/Dialog.js";
@@ -21,6 +21,8 @@ export function NodesPanel({
   toastError: (message: string) => void;
 }) {
   const [createOpen, setCreateOpen] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const editingNode = editingId ? nodes.find((n) => n.id === editingId) ?? null : null;
   const [refreshingId, setRefreshingId] = useState<string | null>(null);
   const [monitorNodeId, setMonitorNodeId] = useState<string | null>(null);
   const monitorNode = monitorNodeId ? nodes.find((n) => n.id === monitorNodeId) ?? null : null;
@@ -160,7 +162,10 @@ export function NodesPanel({
                 <button type="button" className="btn btn-ghost btn-sm" onClick={() => refreshOne(node)} disabled={refreshingId === node.id}>
                   <RefreshCw size={12} className={refreshingId === node.id ? "spin" : ""} /> 刷新
                 </button>
-                <button type="button" className="btn btn-ghost btn-sm" disabled title="Token 不会回显">
+                <button type="button" className="btn btn-ghost btn-sm" onClick={() => setEditingId(node.id)}>
+                  <Pencil size={12} /> 编辑
+                </button>
+                <button type="button" className="btn btn-ghost btn-sm" disabled title="Token 不会回显,使用「编辑」修改">
                   <KeyRound size={12} /> Token
                 </button>
               </div>
@@ -174,6 +179,15 @@ export function NodesPanel({
           onCreated={async () => { await reload(); toastSuccess("节点已添加"); }}
           onError={toastError}
           onClose={() => setCreateOpen(false)}
+        />
+      )}
+
+      {editingNode && (
+        <EditNodeDialog
+          node={editingNode}
+          onSaved={async () => { await reload(); toastSuccess(`${editingNode.name} 已更新`); }}
+          onError={toastError}
+          onClose={() => setEditingId(null)}
         />
       )}
     </div>
@@ -238,6 +252,113 @@ function CreateNodeDialog({
           <label className="field-label">Agent Token</label>
           <input className="input" type="password" value={agentToken} onChange={(event) => setAgentToken(event.target.value)} placeholder="agent 配置中的 AGENT_TOKEN" />
           <p className="field-hint">保存后不再回显,请确保和 agent 端配置一致。</p>
+        </div>
+      </form>
+    </Dialog>
+  );
+}
+
+
+function EditNodeDialog({
+  node,
+  onSaved,
+  onError,
+  onClose
+}: {
+  node: NodeItem;
+  onSaved: () => Promise<void> | void;
+  onError: (message: string) => void;
+  onClose: () => void;
+}) {
+  const [name, setName] = useState(node.name);
+  const [baseUrl, setBaseUrl] = useState(node.baseUrl);
+  // Token is never echoed back from the API. Empty here means "don't change".
+  const [agentToken, setAgentToken] = useState("");
+  const [priority, setPriority] = useState<string>(String(node.priority));
+  const [busy, setBusy] = useState(false);
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    const body: Record<string, unknown> = {};
+    if (name.trim() && name.trim() !== node.name) body.name = name.trim();
+    if (baseUrl.trim() && baseUrl.trim() !== node.baseUrl) body.baseUrl = baseUrl.trim();
+    if (agentToken.trim().length > 0) {
+      if (agentToken.trim().length < 24) {
+        onError("Agent Token 至少 24 个字符");
+        return;
+      }
+      body.agentToken = agentToken.trim();
+    }
+    const priorityNum = Number(priority);
+    if (Number.isFinite(priorityNum) && priorityNum !== node.priority) {
+      body.priority = priorityNum;
+    }
+    if (Object.keys(body).length === 0) {
+      onClose();
+      return;
+    }
+    setBusy(true);
+    try {
+      await api(`/nodes/${node.id}`, { method: "PATCH", body: JSON.stringify(body) });
+      await onSaved();
+      onClose();
+    } catch (err) {
+      onError(err instanceof Error ? err.message : "保存节点失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Dialog
+      title={`编辑节点 — ${node.name}`}
+      icon={<Pencil size={16} style={{ color: "var(--brand)", marginRight: 8 }} />}
+      onClose={onClose}
+      footer={
+        <>
+          <button type="button" className="btn btn-ghost" onClick={onClose} disabled={busy}>取消</button>
+          <button type="submit" form="edit-node-form" className="btn btn-primary" disabled={busy}>
+            {busy && <span className="spinner" />}保存
+          </button>
+        </>
+      }
+    >
+      <form id="edit-node-form" className="stack" onSubmit={submit}>
+        <div className="field">
+          <label className="field-label">名称</label>
+          <input className="input" value={name} onChange={(event) => setName(event.target.value)} />
+          <p className="field-hint">建议与 agent 的 NODE_ID 保持一致。</p>
+        </div>
+        <div className="field">
+          <label className="field-label">Base URL</label>
+          <input className="input" value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder="http://10.0.0.2:4010" />
+          <p className="field-hint">改了之后下一次探测会重新尝试,失败计数会清零。</p>
+        </div>
+        <div className="field">
+          <label className="field-label">Agent Token</label>
+          <input
+            className="input"
+            type="password"
+            value={agentToken}
+            onChange={(event) => setAgentToken(event.target.value)}
+            placeholder="留空则不修改"
+            autoComplete="new-password"
+          />
+          <p className="field-hint">
+            agent 那边 .env 改了 / 重新生成了 token,把新值粘进这里。留空不变。
+          </p>
+        </div>
+        <div className="field">
+          <label className="field-label">优先级</label>
+          <input
+            className="input"
+            type="number"
+            min={1}
+            max={1000}
+            value={priority}
+            onChange={(event) => setPriority(event.target.value)}
+          />
+          <p className="field-hint">数字越小越优先,新写入会先填这里。1-1000。</p>
         </div>
       </form>
     </Dialog>
