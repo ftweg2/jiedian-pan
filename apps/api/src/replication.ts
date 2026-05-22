@@ -1021,10 +1021,17 @@ export async function refreshNodeStatus(prisma: PrismaClient, node: StorageNode)
     throw new Error(`storage node identity mismatch: expected ${node.name} (${node.id}), got ${status.nodeId}`);
   }
 
+  // Only auto-promote OFFLINE/DEGRADED nodes back to ACTIVE on successful probe.
+  // DECOMMISSIONING / DISABLED must be preserved — they're admin-driven states
+  // and we must not silently override them just because the agent is reachable.
+  const nextStatus = (node.status === StorageNodeStatus.DECOMMISSIONING || node.status === StorageNodeStatus.DISABLED)
+    ? node.status
+    : StorageNodeStatus.ACTIVE;
+
   return prisma.storageNode.update({
     where: { id: node.id },
     data: {
-      status: StorageNodeStatus.ACTIVE,
+      status: nextStatus,
       lastSeenAt: new Date(),
       freeBytes: BigInt(status.freeBytes),
       totalBytes: BigInt(status.totalBytes)
