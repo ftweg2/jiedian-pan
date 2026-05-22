@@ -251,6 +251,62 @@ export async function createChunkUploadStager(
  *   ]);
  *   const upload = stager.finish();   // throws if any index missing
  */
+/**
+ * Cross-upload capacity coordination.
+ *
+ * When multiple uploads plan concurrently, each one must see the others'
+ * pending reservations or both will think they own the same free bytes and
+ * the slower one will hit ENOSPC mid-upload.
+ *
+ * Module-level state, keyed by session: each session's per-node reserved bytes.
+ * Getter sums across sessions. Decrement on successful write (so as bytes
+ * physically land on disk and the agent's reported freeBytes drops to reflect
+ * them, the reservation stops double-counting). Release any remainder on
+ * session finish/abort.
+ */
+const reservationsBySession = new Map<string /*sessionId*/, Map<string /*nodeId*/, bigint>>();
+
+function totalReservedFor(nodeId: string): bigint {
+  let total = 0n;
+  for (const sessionMap of reservationsBySession.values()) {
+    total += sessionMap.get(nodeId) ?? 0n;
+  }
+  return total;
+}
+
+function addReservation(sessionId: string, nodeId: string, bytes: bigint): void {
+  let sessionMap = reservationsBySession.get(sessionId);
+  if (!sessionMap) { sessionMap = new Map(); reservationsBySession.set(sessionId, sessionMap); }
+  sessionMap.set(nodeId, (sessionMap.get(nodeId) ?? 0n) + bytes);
+}
+
+function decrementReservation(sessionId: string, nodeId: string, bytes: bigint): void {
+  const sessionMap = reservationsBySession.get(sessionId);
+  if (!sessionMap) return;
+  const next = (sessionMap.get(nodeId) ?? 0n) - bytes;
+  if (next <= 0n) sessionMap.delete(nodeId);
+  else sessionMap.set(nodeId, next);
+  if (sessionMap.size === 0) reservationsBySession.delete(sessionId);
+}
+
+function releaseSessionReservations(sessionId: string): void {
+  reservationsBySession.delete(sessionId);
+}
+
+/**
+ * Snapshot the current reservation map as a Map<nodeId, bigint> for the
+ * synchronous pickNodesFromCache() helper to consume.
+ */
+function snapshotReservations(): Map<string, bigint> {
+  const out = new Map<string, bigint>();
+  for (const sessionMap of reservationsBySession.values()) {
+    for (const [nodeId, bytes] of sessionMap) {
+      out.set(nodeId, (out.get(nodeId) ?? 0n) + bytes);
+    }
+  }
+  return out;
+}
+
 export async function createPlannedChunkStager(
   prisma: PrismaClient,
   policy: StoragePolicy,
@@ -258,7 +314,6 @@ export async function createPlannedChunkStager(
   chunkSizeBytes = CHUNK_SIZE_BYTES
 ): Promise<ChunkUploadStager> {
   const chunkSizes = plannedChunkSizes(totalSizeBytes, chunkSizeBytes);
-  const reservedBytesByNodeId = new Map<string, bigint>();
   const plans: Array<{ index: number; sizeBytes: number; nodes: StorageNode[] }> = [];
 
   // Refresh node status ONCE at planning time. Without this, the per-chunk
@@ -268,19 +323,90 @@ export async function createPlannedChunkStager(
   // reservation map drive subsequent capacity decisions.
   const activeNodes = await refreshActiveNodesOnce(prisma);
   const requiredReplicas = requiredReplicaCount(policy);
+  const sessionId = randomUUID();
 
+  // Plan all chunks. Reserve cumulatively against the GLOBAL reservation map
+  // so other concurrent uploads' planners see this session's commitments.
   for (const [index, sizeBytes] of chunkSizes.entries()) {
-    const nodes = pickNodesFromCache(activeNodes, policy, requiredReplicas, sizeBytes, reservedBytesByNodeId);
+    const reservedSnapshot = snapshotReservations();
+    let nodes: StorageNode[];
+    try {
+      nodes = pickNodesFromCache(activeNodes, policy, requiredReplicas, sizeBytes, reservedSnapshot);
+    } catch (err) {
+      // Roll back this session's reservations so far before bubbling the error.
+      releaseSessionReservations(sessionId);
+      throw err;
+    }
     plans.push({ index, sizeBytes, nodes });
     for (const node of nodes) {
-      reservedBytesByNodeId.set(node.id, (reservedBytesByNodeId.get(node.id) ?? 0n) + BigInt(sizeBytes));
+      addReservation(sessionId, node.id, BigInt(sizeBytes));
     }
   }
 
-  const uploadId = randomUUID();
+  const uploadId = sessionId;
   const chunks = new Map<number, StagedEncryptedChunk>();
   const stagedReplicas: StagedChunkReplica[] = [];
   const stagedReplicasLock = { value: Promise.resolve() };
+  const excludedNodeIds = new Set<string>();
+
+  /**
+   * Try writing the chunk to each node in `nodes`. Returns the replica records on
+   * full success. Throws on first failure (caller handles failover).
+   */
+  async function writeToNodes(chunk: EncryptedStreamChunk, nodes: StorageNode[]): Promise<StagedChunkReplica[]> {
+    const replicas: StagedChunkReplica[] = [];
+    for (const node of nodes) {
+      const replica = await putStagedChunkObject(node, uploadId, chunk);
+      replicas.push(replica);
+    }
+    return replicas;
+  }
+
+  /**
+   * If the chunk's planned nodes have failed and we want to find new ones,
+   * pick fresh nodes (excluding the previously-failed ones for this session)
+   * and update the plan AND ALL future plans that also reference those nodes.
+   */
+  function reroutePlans(badNodeIds: string[], fromIndex: number): void {
+    for (const nodeId of badNodeIds) excludedNodeIds.add(nodeId);
+    for (let i = fromIndex; i < plans.length; i += 1) {
+      const p = plans[i];
+      if (!p.nodes.some((n) => badNodeIds.includes(n.id))) continue;
+      // Release this chunk's reservations on bad nodes; will re-add on new nodes
+      for (const node of p.nodes) {
+        if (badNodeIds.includes(node.id)) {
+          decrementReservation(sessionId, node.id, BigInt(p.sizeBytes));
+        }
+      }
+      const reservedSnapshot = snapshotReservations();
+      const newNodes = pickNodesFromCache(activeNodes, policy, requiredReplicas, p.sizeBytes, reservedSnapshot, excludedNodeIds);
+      // Keep nodes that were good, replace bad ones from newNodes
+      const merged: StorageNode[] = [];
+      for (const old of p.nodes) {
+        if (!badNodeIds.includes(old.id)) merged.push(old);
+      }
+      for (const fresh of newNodes) {
+        if (merged.length >= requiredReplicas) break;
+        if (!merged.some((m) => m.id === fresh.id)) merged.push(fresh);
+      }
+      p.nodes = merged;
+      // Reserve on newly-introduced nodes
+      for (const node of merged) {
+        if (badNodeIds.includes(node.id)) continue; // shouldn't happen but safe
+        // Only add reservation if it's a NEW node (not one we kept)
+        // To keep it simple, decrement+re-add for ALL chunks of this plan:
+      }
+      // Simpler: just add for all current nodes (we already decremented bad ones)
+      // For the kept-good nodes, their reservation is unchanged.
+      // For the newly-added nodes, add fresh reservation.
+      const oldNodeIds = new Set(p.nodes.filter((n) => !badNodeIds.includes(n.id)).map((n) => n.id));
+      for (const node of merged) {
+        if (!oldNodeIds.has(node.id)) {
+          addReservation(sessionId, node.id, BigInt(p.sizeBytes));
+        }
+      }
+    }
+  }
 
   return {
     async stageChunk(chunk) {
@@ -297,15 +423,40 @@ export async function createPlannedChunkStager(
         );
       }
 
-      const replicas: StagedChunkReplica[] = [];
-      for (const node of plan.nodes) {
-        try {
-          const replica = await putStagedChunkObject(node, uploadId, chunk);
-          replicas.push(replica);
-        } catch (error) {
-          // best-effort: leave any successful writes to be cleaned by stager.cleanup()
+      let replicas: StagedChunkReplica[];
+      try {
+        replicas = await writeToNodes(chunk, plan.nodes);
+      } catch (error) {
+        if (!isNodeConnectivityError(error)) {
           throw new Error(`chunk upload failure: chunk ${chunk.index} replica write failed: ${errorMessage(error)}`);
         }
+        // Connectivity failure → assume the assigned nodes are dead, reroute
+        // this chunk + all subsequent chunks that referenced the same nodes.
+        const badNodeIds = plan.nodes.map((n) => n.id);
+        for (const nodeId of badNodeIds) {
+          await prisma.storageNode.update({
+            where: { id: nodeId },
+            data: { status: StorageNodeStatus.OFFLINE }
+          }).catch(() => undefined);
+        }
+        try {
+          reroutePlans(badNodeIds, chunk.index);
+        } catch (planErr) {
+          throw new Error(`chunk upload failure: chunk ${chunk.index} could not be rerouted: ${errorMessage(planErr)}`);
+        }
+        // Single retry on the new plan
+        try {
+          replicas = await writeToNodes(chunk, plan.nodes);
+        } catch (retryError) {
+          throw new Error(`chunk upload failure: chunk ${chunk.index} write failed after reroute: ${errorMessage(retryError)}`);
+        }
+      }
+
+      // Decrement reservation for the bytes we just successfully wrote.
+      // The agent's freeBytes (refreshed on the next planner round) now reflects
+      // these bytes, so we MUST stop counting them in the reservation map.
+      for (const node of plan.nodes) {
+        decrementReservation(sessionId, node.id, BigInt(plan.sizeBytes));
       }
 
       // serialize the push into the shared array
@@ -326,6 +477,8 @@ export async function createPlannedChunkStager(
       });
     },
     finish() {
+      // All chunks committed → any leftover reservation slots release now.
+      releaseSessionReservations(sessionId);
       if (chunks.size !== plans.length) {
         const missing: number[] = [];
         for (let i = 0; i < plans.length; i += 1) if (!chunks.has(i)) missing.push(i);
@@ -340,6 +493,7 @@ export async function createPlannedChunkStager(
       };
     },
     async cleanup() {
+      releaseSessionReservations(sessionId);
       await cleanupStagedReplicas(stagedReplicas);
     }
   };
@@ -994,14 +1148,16 @@ function pickNodesFromCache(
   policy: StoragePolicy,
   required: number,
   objectSizeBytes: number,
-  reservedBytesByNodeId: Map<string, bigint>
+  reservedBytesByNodeId: Map<string, bigint>,
+  excludedNodeIds: Set<string> = new Set()
 ): StorageNode[] {
   if (required <= 0) return [];
-  if (nodes.length < required) {
-    throw new Error(`not enough active storage nodes: required ${required}, found ${nodes.length}`);
+  const eligible = nodes.filter((n) => !excludedNodeIds.has(n.id));
+  if (eligible.length < required) {
+    throw new Error(`not enough active storage nodes: required ${required}, found ${eligible.length}`);
   }
   const picked: StorageNode[] = [];
-  for (const node of nodes) {
+  for (const node of eligible) {
     if (hasCapacity(node, objectSizeBytes, reservedBytesByNodeId.get(node.id) ?? 0n)) {
       picked.push(node);
       if (picked.length >= required) break;
