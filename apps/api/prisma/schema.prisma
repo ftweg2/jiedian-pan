@@ -171,8 +171,21 @@ model StorageNode {
   replicas        ObjectReplica[]
   chunkReplicas   ChunkReplica[]
   accessLogs      AccessLog[]
+  probes          NodeProbe[]
 
   @@index([status, priority])
+}
+
+model NodeProbe {
+  id          String      @id @default(cuid())
+  nodeId      String
+  observedAt  DateTime    @default(now())
+  ok          Boolean
+  latencyMs   Int
+  error       String?
+  node        StorageNode @relation(fields: [nodeId], references: [id], onDelete: Cascade)
+
+  @@index([nodeId, observedAt])
 }
 
 model ObjectReplica {

@@ -1311,6 +1311,50 @@ button:focus-visible, .btn:focus-visible, .input:focus-visible,
 }
 
 /* =============================================================
+ * Node monitor — 60-bucket status strip + latency chart
+ * ============================================================= */
+.status-strip {
+  display: grid;
+  grid-template-columns: repeat(60, 1fr);
+  gap: 3px;
+  padding: 16px;
+  background: var(--bg-muted);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+}
+.status-pill {
+  display: block;
+  height: 28px;
+  border-radius: 5px;
+  background: var(--bg-subtle);
+  transition: background 120ms ease, transform 120ms ease;
+}
+.status-pill:hover { transform: translateY(-1px); }
+.status-pill.is-ok { background: var(--good); }
+.status-pill.is-degraded { background: var(--warn); }
+.status-pill.is-down { background: var(--danger); }
+.status-pill.is-empty { background: var(--bg-subtle); opacity: 0.45; }
+
+.latency-chart-wrap {
+  position: relative;
+  width: 100%;
+  background: var(--bg-muted);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  padding: 8px;
+}
+.latency-chart {
+  width: 100%;
+  height: 220px;
+  display: block;
+}
+
+.spin { animation: spin 1.2s linear infinite; }
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* =============================================================
  * Folder share landing page (Baidu Netdisk-ish layout)
  * ============================================================= */
 .folder-share-shell {

@@ -1769,6 +1769,91 @@ export async function buildServer(env: ApiEnv, prisma: PrismaClient) {
     return reply.code(201).send({ node: serializeNode(node) });
   });
 
+  // Node monitoring: returns 60 aggregated buckets covering the requested
+  // window + summary stats (current ping, 24h avg, uptime %, etc.).
+  app.get<{ Params: { id: string }; Querystring: { range?: string } }>("/nodes/:id/probes", async (request, reply) => {
+    const user = await requireAdmin(prisma, request, reply);
+    if (!user) return;
+
+    const node = await prisma.storageNode.findUnique({ where: { id: request.params.id } });
+    if (!node) return reply.code(404).send({ error: "node not found" });
+
+    const range = (request.query.range ?? "1h").toLowerCase();
+    const rangeMs = parseRangeMs(range);
+    if (rangeMs == null) {
+      return reply.code(400).send({ error: "invalid range; use 1h|6h|24h|7d|30d" });
+    }
+
+    const now = Date.now();
+    const from = new Date(now - rangeMs);
+    const probes = await prisma.nodeProbe.findMany({
+      where: { nodeId: node.id, observedAt: { gte: from } },
+      orderBy: { observedAt: "asc" },
+      select: { observedAt: true, ok: true, latencyMs: true }
+    });
+
+    // Always 60 buckets so the UI's bar chart is consistent across ranges.
+    const BUCKET_COUNT = 60;
+    const bucketMs = rangeMs / BUCKET_COUNT;
+    const buckets: Array<{ at: string; latencyMs: number | null; uptimePct: number; sampleCount: number }> = [];
+    for (let i = 0; i < BUCKET_COUNT; i += 1) {
+      const bucketStart = now - rangeMs + i * bucketMs;
+      const bucketEnd = bucketStart + bucketMs;
+      const slice = probes.filter((p) => p.observedAt.getTime() >= bucketStart && p.observedAt.getTime() < bucketEnd);
+      const okCount = slice.filter((p) => p.ok).length;
+      const avgLatency = okCount > 0
+        ? Math.round(slice.filter((p) => p.ok).reduce((sum, p) => sum + p.latencyMs, 0) / okCount)
+        : null;
+      buckets.push({
+        at: new Date(bucketStart + bucketMs / 2).toISOString(),
+        latencyMs: avgLatency,
+        uptimePct: slice.length > 0 ? Math.round((okCount / slice.length) * 100) : -1,
+        sampleCount: slice.length
+      });
+    }
+
+    // Summary stats. Compute fresh queries scoped to wider windows.
+    const [last24h, last30d, all] = await Promise.all([
+      prisma.nodeProbe.findMany({
+        where: { nodeId: node.id, observedAt: { gte: new Date(now - 24 * 60 * 60 * 1000) } },
+        select: { ok: true, latencyMs: true }
+      }),
+      prisma.nodeProbe.findMany({
+        where: { nodeId: node.id, observedAt: { gte: new Date(now - 30 * 24 * 60 * 60 * 1000) } },
+        select: { ok: true }
+      }),
+      prisma.nodeProbe.findMany({
+        where: { nodeId: node.id },
+        select: { ok: true }
+      })
+    ]);
+    const currentProbe = probes[probes.length - 1] ?? null;
+    const ok24 = last24h.filter((p) => p.ok);
+    const summary = {
+      currentLatencyMs: currentProbe?.ok ? currentProbe.latencyMs : null,
+      currentOk: currentProbe?.ok ?? null,
+      avgLatency24hMs: ok24.length > 0
+        ? Math.round(ok24.reduce((sum, p) => sum + p.latencyMs, 0) / ok24.length)
+        : null,
+      uptime24hPct: last24h.length > 0 ? +(ok24.length / last24h.length * 100).toFixed(2) : null,
+      uptime30dPct: last30d.length > 0
+        ? +(last30d.filter((p) => p.ok).length / last30d.length * 100).toFixed(2)
+        : null,
+      uptimeAllPct: all.length > 0
+        ? +(all.filter((p) => p.ok).length / all.length * 100).toFixed(2)
+        : null,
+      totalProbeCount: all.length
+    };
+
+    return {
+      node: { id: node.id, name: node.name },
+      range,
+      probeIntervalSec: 30,
+      buckets,
+      summary
+    };
+  });
+
   app.get("/access-logs", async (request, reply) => {
     const user = await requireAdmin(prisma, request, reply);
     if (!user) return;
@@ -2176,6 +2261,17 @@ setInterval(() => {
     if (record.attempts.length === 0) shareAuthAttempts.delete(key);
   }
 }, 5 * 60 * 1000).unref?.();
+
+function parseRangeMs(range: string): number | null {
+  const map: Record<string, number> = {
+    "1h": 60 * 60 * 1000,
+    "6h": 6 * 60 * 60 * 1000,
+    "24h": 24 * 60 * 60 * 1000,
+    "7d": 7 * 24 * 60 * 60 * 1000,
+    "30d": 30 * 24 * 60 * 60 * 1000
+  };
+  return map[range] ?? null;
+}
 
 function sanitizeFilename(name: string): string {
   return name.replace(/[\\/:*?"<>|\x00-\x1f]/g, "_").replace(/^\.+/, "_").slice(0, 200);

@@ -1,10 +1,11 @@
-import { Copy, HardDrive, KeyRound, Plus, RefreshCw } from "lucide-react";
+import { Activity, Copy, HardDrive, KeyRound, Plus, RefreshCw } from "lucide-react";
 import { useState, type FormEvent } from "react";
 import { api, type NodeItem } from "../api.js";
 import { Dialog } from "../components/Dialog.js";
 import { EmptyState } from "../components/Empty.js";
 import { nodeRefreshErrorMessage } from "../lib/errors.js";
 import { formatBytes, formatDateTime, nodeStatusLabel } from "../lib/format.js";
+import { NodeMonitorView } from "./NodeMonitor.js";
 
 export function NodesPanel({
   nodes,
@@ -21,6 +22,18 @@ export function NodesPanel({
 }) {
   const [createOpen, setCreateOpen] = useState(false);
   const [refreshingId, setRefreshingId] = useState<string | null>(null);
+  const [monitorNodeId, setMonitorNodeId] = useState<string | null>(null);
+  const monitorNode = monitorNodeId ? nodes.find((n) => n.id === monitorNodeId) ?? null : null;
+
+  if (monitorNode) {
+    return (
+      <NodeMonitorView
+        node={monitorNode}
+        onBack={() => setMonitorNodeId(null)}
+        toastError={toastError}
+      />
+    );
+  }
 
   const health = nodes.reduce(
     (acc, node) => {
@@ -112,7 +125,10 @@ export function NodesPanel({
                 </p>
               )}
 
-              <div className="row" style={{ gap: 6 }}>
+              <div className="row" style={{ gap: 6, flexWrap: "wrap" }}>
+                <button type="button" className="btn btn-secondary btn-sm" onClick={() => setMonitorNodeId(node.id)}>
+                  <Activity size={12} /> 监控
+                </button>
                 <button type="button" className="btn btn-ghost btn-sm" onClick={() => copyAddress(node)}>
                   <Copy size={12} /> 复制地址
                 </button>
