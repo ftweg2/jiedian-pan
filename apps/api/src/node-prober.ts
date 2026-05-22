@@ -1,5 +1,5 @@
 import { ReplicaStatus, StorageNodeStatus, type PrismaClient } from "@prisma/client";
-import { backfillImportantReplicas } from "./replication.js";
+import { backfillImportantReplicas, reverifyNodeMissingReplicas } from "./replication.js";
 
 /**
  * Periodically probes each non-disabled storage node by hitting its
@@ -100,6 +100,26 @@ async function probeOne(
         where: { id: node.id },
         data: { consecutiveProbeFailures: 0 }
       }).catch(() => undefined);
+
+      // Recovery from probe failures: the node was previously unreachable
+      // and is now back. Fire a reverify pass in the background so any
+      // MISSING replicas on this node get checked + flipped back to
+      // AVAILABLE if the data is actually still there. This is the bit
+      // that auto-heals "false-alarm" lost-node situations without
+      // requiring admin intervention.
+      const fullNode = await prisma.storageNode.findUnique({ where: { id: node.id } });
+      if (fullNode) {
+        reverifyNodeMissingReplicas(prisma, fullNode, { maxReplicas: 500 })
+          .then((r) => {
+            if (r.checked > 0) {
+              console.info(
+                `node-prober: auto-reverify on recovery for ${node.name} — ` +
+                `recovered ${r.chunkRecovered + r.objectRecovered}/${r.checked}`
+              );
+            }
+          })
+          .catch((err) => console.error("auto-reverify after probe recovery failed", err));
+      }
     }
     return;
   }

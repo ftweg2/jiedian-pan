@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { FileStatus, ReplicaStatus, ShareStatus, StorageNodeStatus, StoragePolicy, type PrismaClient } from "@prisma/client";
 import { AgentStorageDriver } from "@wangpan/storage-driver";
-import { deleteReplicasForFile, backfillImportantReplicas, refreshNodeStatus } from "./replication.js";
+import { deleteReplicasForFile, backfillImportantReplicas, refreshNodeStatus, reverifyNodeMissingReplicas } from "./replication.js";
 
 const ORPHAN_SWEEP_INTERVAL_MS = 60 * 60 * 1000; // run orphan sweep at most every hour
 let lastOrphanSweepAt = 0;
@@ -79,6 +79,15 @@ export async function runMaintenance(prisma: PrismaClient): Promise<void> {
     console.error("decommission drain failed", error);
   });
 
+  // Idle reverify pass: for each healthy node, ask agent if a small batch of
+  // MISSING replicas is actually still there. Catches the edge case where
+  // a replica got marked MISSING (network blip, transient auth issue) but
+  // the data on disk is fine. 50 per node per tick = bounded work, gets
+  // through ~3000 replicas an hour without slamming any single agent.
+  await reverifyMissingReplicasJob(prisma).catch((error) => {
+    console.error("reverify missing replicas pass failed", error);
+  });
+
   // Sweep orphan chunk-upload objects at most once an hour. Cleans up bytes
   // left on storage agents when the API process crashed mid-upload (in-memory
   // session lost) or when /chunk PUT failed without an explicit abort.
@@ -87,6 +96,38 @@ export async function runMaintenance(prisma: PrismaClient): Promise<void> {
     sweepOrphanChunkUploads(prisma).catch((error) => {
       console.error("orphan sweep failed", error);
     });
+  }
+}
+
+const REVERIFY_PER_NODE_PER_TICK = Number(process.env.REVERIFY_PER_NODE_PER_TICK ?? 50);
+
+/**
+ * Per-tick reverify pass: for every healthy node, ask the agent about a
+ * bounded batch of MISSING replicas. Recovers from "false MISSING" without
+ * any admin click. Skips LOST / DISABLED (no point asking) and DECOMMISSIONING
+ * (drain owns those). Bounded so big node piles don't stall maintenance.
+ */
+async function reverifyMissingReplicasJob(prisma: PrismaClient): Promise<void> {
+  const nodes = await prisma.storageNode.findMany({
+    where: {
+      status: { in: [StorageNodeStatus.ACTIVE, StorageNodeStatus.DEGRADED] }
+    }
+  });
+  for (const node of nodes) {
+    try {
+      const r = await reverifyNodeMissingReplicas(prisma, node, {
+        maxReplicas: REVERIFY_PER_NODE_PER_TICK
+      });
+      if (r.checked > 0) {
+        console.info(
+          `reverify-pass: ${node.name} — checked ${r.checked}, ` +
+          `recovered ${r.chunkRecovered + r.objectRecovered}, ` +
+          `still-missing ${r.chunkStillMissing + r.objectStillMissing}`
+        );
+      }
+    } catch (err) {
+      console.warn(`reverify-pass: ${node.name} failed`, err);
+    }
   }
 }
 

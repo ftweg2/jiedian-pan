@@ -1176,6 +1176,109 @@ async function backfillChunkedVersion(
   return created;
 }
 
+/**
+ * Walk MISSING replicas on a node, ask the agent via verifyObject whether the
+ * bytes are actually still there + match the expected SHA. If yes, flip the
+ * replica back to AVAILABLE. Used in three places:
+ *   - POST /nodes/:id/reverify (admin button)
+ *   - prober (auto-fires when a node recovers from probe failures)
+ *   - runMaintenance (idle pass — 60s tick, limited)
+ *
+ * `maxReplicas` caps the work so the maintenance tick doesn't run forever
+ * on huge MISSING piles. Omit (or pass Infinity) for the admin endpoint.
+ */
+export async function reverifyNodeMissingReplicas(
+  prisma: PrismaClient,
+  node: StorageNode,
+  options: { maxReplicas?: number; concurrency?: number } = {}
+): Promise<{ checked: number; chunkRecovered: number; chunkStillMissing: number; objectRecovered: number; objectStillMissing: number }> {
+  const maxReplicas = options.maxReplicas ?? Infinity;
+  const concurrency = options.concurrency ?? 6;
+
+  // Skip nodes that aren't reachable (no point calling verify).
+  if (node.status === StorageNodeStatus.DISABLED || node.status === StorageNodeStatus.LOST) {
+    return { checked: 0, chunkRecovered: 0, chunkStillMissing: 0, objectRecovered: 0, objectStillMissing: 0 };
+  }
+
+  const chunkBudget = Math.max(0, Math.floor(maxReplicas));
+  const chunkMissing = await prisma.chunkReplica.findMany({
+    where: { nodeId: node.id, status: ReplicaStatus.MISSING },
+    select: { id: true, objectId: true, ciphertextSha256: true },
+    take: chunkBudget,
+    orderBy: { createdAt: "asc" }
+  });
+  const objectBudget = Math.max(0, chunkBudget - chunkMissing.length);
+  const objectMissing = objectBudget > 0 ? await prisma.objectReplica.findMany({
+    where: { nodeId: node.id, status: ReplicaStatus.MISSING },
+    select: { id: true, objectId: true, ciphertextSha256: true },
+    take: objectBudget,
+    orderBy: { createdAt: "asc" }
+  }) : [];
+
+  if (chunkMissing.length === 0 && objectMissing.length === 0) {
+    return { checked: 0, chunkRecovered: 0, chunkStillMissing: 0, objectRecovered: 0, objectStillMissing: 0 };
+  }
+
+  const driver = driverForNode(node);
+  let chunkRecovered = 0;
+  let chunkStillMissing = 0;
+  let objectRecovered = 0;
+  let objectStillMissing = 0;
+
+  async function pool<T>(items: T[], width: number, fn: (item: T) => Promise<void>): Promise<void> {
+    let i = 0;
+    const workers = Array.from({ length: Math.min(width, items.length) }, async () => {
+      while (i < items.length) {
+        const idx = i++;
+        await fn(items[idx]).catch(() => undefined);
+      }
+    });
+    await Promise.all(workers);
+  }
+
+  await pool(chunkMissing, concurrency, async (r) => {
+    try {
+      const v = await driver.verifyObject(r.objectId, r.ciphertextSha256);
+      if (v.exists && v.matches) {
+        await prisma.chunkReplica.update({
+          where: { id: r.id },
+          data: { status: ReplicaStatus.AVAILABLE, verifiedAt: new Date() }
+        });
+        chunkRecovered += 1;
+      } else {
+        chunkStillMissing += 1;
+      }
+    } catch {
+      chunkStillMissing += 1;
+    }
+  });
+
+  await pool(objectMissing, concurrency, async (r) => {
+    try {
+      const v = await driver.verifyObject(r.objectId, r.ciphertextSha256);
+      if (v.exists && v.matches) {
+        await prisma.objectReplica.update({
+          where: { id: r.id },
+          data: { status: ReplicaStatus.AVAILABLE, verifiedAt: new Date() }
+        });
+        objectRecovered += 1;
+      } else {
+        objectStillMissing += 1;
+      }
+    } catch {
+      objectStillMissing += 1;
+    }
+  });
+
+  return {
+    checked: chunkMissing.length + objectMissing.length,
+    chunkRecovered,
+    chunkStillMissing,
+    objectRecovered,
+    objectStillMissing
+  };
+}
+
 export async function refreshNodeStatus(prisma: PrismaClient, node: StorageNode) {
   const status = await driverForNode(node).getStatus();
   if (status.nodeId && status.nodeId !== node.name && status.nodeId !== node.id) {
