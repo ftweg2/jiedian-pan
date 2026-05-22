@@ -1,6 +1,6 @@
 import { AlertCircle, Download, Eye, Link2, Trash2, X } from "lucide-react";
 import { useEffect, useState } from "react";
-import { api, download, type FileDetail, type FileItem, type FileVersionDetail, type ShareList } from "../api.js";
+import { api, download, type FileDetail, type FileItem, type FileVersionDetail, type ShareList, type StorageDistributionEntry } from "../api.js";
 import { FileTypeIcon } from "../components/FileIcon.js";
 import { PolicyBadge, ReplicaBadge, ReplicaStatusBadge, StatusBadge } from "../components/Badges.js";
 import { fileDetailErrorMessage, stage8ErrorMessage } from "../lib/errors.js";
@@ -14,7 +14,7 @@ import {
   versionDownloadName,
   versionSizeLabel
 } from "../lib/file-detail.js";
-import { formatBytes, formatDateTime, policyLabel } from "../lib/format.js";
+import { formatBytes, formatDateTime, nodeStatusLabel, policyLabel } from "../lib/format.js";
 
 type Tab = "overview" | "versions" | "storage" | "shares" | "access";
 
@@ -79,6 +79,7 @@ export function FileDetailDrawer({
   const versions = detail?.versions?.length ? detail.versions : latest ? [latest] : [];
   const replicas = latest?.replicas ?? [];
   const storageLayout = detail?.storageLayout ?? storageLayoutFromFile(currentFile);
+  const storageDistribution = detail?.storageDistribution ?? null;
   const chunks = detail?.chunks ?? [];
   const risks = detail?.risks?.length ? detail.risks : inferFileRisks(currentFile, replicas);
   const active = currentFile.status === "active";
@@ -184,6 +185,43 @@ export function FileDetailDrawer({
                   </p>
                 ) : <p className="muted" style={{ fontSize: 13 }}>后端尚未返回存储布局。</p>}
               </div>
+
+              {storageDistribution && storageDistribution.nodes.length > 0 && (
+                <div>
+                  <h3 className="section-title">存储位置</h3>
+                  <p className="muted" style={{ fontSize: 12, marginBottom: 6 }}>
+                    {storageDistribution.isSingleNode
+                      ? `当前只在 1 个 VPS 上(${storageDistribution.nodes[0].nodeName}),没有冗余。`
+                      : `分布在 ${storageDistribution.nodeCount} 个 VPS 上`}
+                  </p>
+                  <div className="table-wrap">
+                    <table className="table">
+                      <thead><tr><th>节点</th><th>状态</th><th>占用</th><th>副本数</th></tr></thead>
+                      <tbody>
+                        {storageDistribution.nodes.map((n: StorageDistributionEntry) => (
+                          <tr key={n.nodeId}>
+                            <td>
+                              <div style={{ fontSize: 13 }}>{n.nodeName}</div>
+                              <div className="muted mono" style={{ fontSize: 11 }}>{n.nodeBaseUrl}</div>
+                            </td>
+                            <td>
+                              <span className={`badge badge-${n.nodeStatus === "active" ? "good" : n.nodeStatus === "lost" || n.nodeStatus === "offline" ? "danger" : "warn"} badge-dot`}>
+                                {nodeStatusLabel(n.nodeStatus)}
+                              </span>
+                            </td>
+                            <td>{formatBytes(Number(n.bytes))}</td>
+                            <td>
+                              {n.wholeReplicaCount > 0 && `${n.wholeReplicaCount} 整文件`}
+                              {n.wholeReplicaCount > 0 && n.chunkReplicaCount > 0 && " · "}
+                              {n.chunkReplicaCount > 0 && `${n.chunkReplicaCount} 分片`}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
 
               <div>
                 <h3 className="section-title">副本状态</h3>

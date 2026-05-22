@@ -42,13 +42,43 @@ export interface NodeItem {
   id: string;
   name: string;
   baseUrl: string;
-  status: "active" | "degraded" | "offline" | "decommissioning" | "disabled";
+  status: "active" | "degraded" | "offline" | "decommissioning" | "lost" | "disabled";
   priority: number;
   lastSeenAt: string | null;
   freeBytes: string | null;
   totalBytes: string | null;
   lastError?: string | null;
   healthMessage?: string | null;
+  /** Number of consecutive failed probes since last success (0 = healthy). */
+  consecutiveProbeFailures?: number;
+  /** ISO timestamp when admin (or prober) declared this node LOST. */
+  lostDeclaredAt?: string | null;
+}
+
+export interface NodeImpact {
+  nodeId: string;
+  replicasOnNode: number;
+  affectedFiles: number;
+  unrecoverableFileCount: number;
+  unrecoverableFiles: Array<{ fileId: string; name: string; unrecoverableChunks: number }>;
+  truncated: boolean;
+}
+
+/** Per-node storage distribution for a single version. From /files/:id/detail. */
+export interface StorageDistributionEntry {
+  nodeId: string;
+  nodeName: string;
+  nodeBaseUrl: string;
+  nodeStatus: NodeItem["status"];
+  bytes: string;
+  wholeReplicaCount: number;
+  chunkReplicaCount: number;
+}
+
+export interface StorageDistribution {
+  nodes: StorageDistributionEntry[];
+  nodeCount: number;
+  isSingleNode: boolean;
 }
 
 export interface AccessLog {
@@ -237,6 +267,7 @@ export interface FileDetail {
   latestVersion?: FileVersionDetail | null;
   versions?: FileVersionDetail[];
   storageLayout?: StorageLayout | null;
+  storageDistribution?: StorageDistribution | null;
   chunks?: FileChunkDetail[];
   shareSummary?: FileShareSummary | null;
   recentAccess?: FileAccessSummary | null;
@@ -250,6 +281,8 @@ export interface FileDetailResponse {
   versions?: FileVersionDetail[];
   replicas?: FileReplicaDetail[];
   storageLayout?: StorageLayout | null;
+  /** Per-node distribution: where this file lives + size on each node. */
+  storageDistribution?: StorageDistribution | null;
   chunks?: FileChunkDetail[];
   shares?: ShareLink[];
   shareSummary?: FileShareSummary | null;

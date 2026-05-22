@@ -1,4 +1,4 @@
-import { Activity, Copy, HardDrive, KeyRound, Plus, RefreshCw } from "lucide-react";
+import { Activity, AlertTriangle, Copy, HardDrive, KeyRound, Plus, RefreshCw } from "lucide-react";
 import { useState, type FormEvent } from "react";
 import { api, type NodeItem } from "../api.js";
 import { Dialog } from "../components/Dialog.js";
@@ -42,8 +42,10 @@ export function NodesPanel({
       acc.total += Number(node.totalBytes ?? 0);
       return acc;
     },
-    { active: 0, degraded: 0, offline: 0, disabled: 0, free: 0, total: 0 } as Record<string, number>
+    { active: 0, degraded: 0, offline: 0, lost: 0, disabled: 0, free: 0, total: 0 } as Record<string, number>
   );
+
+  const lostNodes = nodes.filter((n) => n.status === "lost");
 
   async function copyAddress(node: NodeItem) {
     try {
@@ -78,10 +80,28 @@ export function NodesPanel({
         </button>
       </div>
 
+      {lostNodes.length > 0 && (
+        <div className="alert alert-danger" style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
+          <AlertTriangle size={16} style={{ flexShrink: 0, marginTop: 2 }} />
+          <div className="stack-sm" style={{ flex: 1 }}>
+            <strong style={{ fontSize: 13 }}>
+              {lostNodes.length === 1
+                ? `节点 ${lostNodes[0].name} 已失联`
+                : `${lostNodes.length} 个节点已失联`}
+            </strong>
+            <p className="muted" style={{ fontSize: 12, margin: 0 }}>
+              系统已自动把这些节点上的副本标记为缺失,并尝试在其他节点上补副本。
+              点击节点的「监控」按钮查看影响范围,确认 VPS 是否真的失联。
+            </p>
+          </div>
+        </div>
+      )}
+
       <div className="stat-grid">
         <div className="stat-card"><span className="stat-label">正常</span><span className="stat-value" style={{ color: "var(--good)" }}>{health.active}</span></div>
         <div className="stat-card"><span className="stat-label">降级</span><span className="stat-value" style={{ color: health.degraded > 0 ? "var(--warn)" : undefined }}>{health.degraded}</span></div>
         <div className="stat-card"><span className="stat-label">离线</span><span className="stat-value" style={{ color: health.offline > 0 ? "var(--danger)" : undefined }}>{health.offline}</span></div>
+        <div className="stat-card"><span className="stat-label">失联</span><span className="stat-value" style={{ color: health.lost > 0 ? "var(--danger)" : undefined }}>{health.lost}</span></div>
         <div className="stat-card"><span className="stat-label">停用</span><span className="stat-value">{health.disabled}</span></div>
         <div className="stat-card"><span className="stat-label">可用容量</span><span className="stat-value">{formatBytes(health.free)}</span><span className="stat-hint">总 {formatBytes(health.total)}</span></div>
       </div>
@@ -97,6 +117,7 @@ export function NodesPanel({
           const usagePct = total > 0 ? Math.min(100, (used / total) * 100) : 0;
           const barTone = usagePct >= 90 ? "is-danger" : usagePct >= 70 ? "is-warn" : "";
           const tone = node.status === "active" ? "good"
+            : node.status === "lost" ? "danger"
             : node.status === "offline" ? "danger"
             : node.status === "degraded" ? "warn"
             : node.status === "decommissioning" ? "warn"

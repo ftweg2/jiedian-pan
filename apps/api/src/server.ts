@@ -41,6 +41,7 @@ import type { ApiEnv } from "./env.js";
 import { toDbPermission, toDbPolicy, toSharedPolicy } from "./mappers.js";
 import { canAccessFile, canAccessFolder } from "./permissions.js";
 import { kickDrain } from "./cleanup.js";
+import { declareNodeLost } from "./node-prober.js";
 import {
   CHUNK_SIZE_BYTES,
   chunkedVersionHasPerChunkEncryption,
@@ -566,6 +567,10 @@ export async function buildServer(env: ApiEnv, prisma: PrismaClient) {
       file: serializeFile(file),
       latestVersion: latestVersion ? serializeVersionDetail(latestVersion) : null,
       storageLayout: latestVersion ? serializeStorageLayout(latestVersion) : serializeMissingStorageLayout(),
+      // F1: per-node distribution so the UI can answer "where is this file
+      // stored, on how many VPSes, how big on each?" without recomputing it
+      // from the raw replica list.
+      storageDistribution: latestVersion ? serializeStorageDistribution(latestVersion) : { nodes: [], nodeCount: 0, isSingleNode: true },
       replicas: latestVersion?.replicas.map(serializeReplicaDetail) ?? [],
       chunks: latestVersion?.chunks.map(serializeChunkDetail) ?? [],
       shares: file.shares.map((s) => serializeShareMetadata(s, { publicBaseUrl: env.publicBaseUrl, masterKey: env.masterKey })),
@@ -1977,6 +1982,67 @@ export async function buildServer(env: ApiEnv, prisma: PrismaClient) {
     return { node: serializeNode(restored) };
   });
 
+  // ===== Node-lost detection (Plan B) =====
+  //
+  //   GET  /nodes/:id/impact       → which files lost replicas + how many are unrecoverable
+  //   POST /nodes/:id/declare-lost → admin manually flips node to LOST without waiting for probes
+  //   POST /nodes/:id/restore      → admin says "the VPS is back, treat MISSING replicas as ok"
+  //
+  // Automatic LOST is triggered by node-prober.ts after N consecutive failures.
+
+  app.get<{ Params: { id: string } }>("/nodes/:id/impact", async (request, reply) => {
+    const user = await requireAdmin(prisma, request, reply);
+    if (!user) return;
+    const node = await prisma.storageNode.findUnique({ where: { id: request.params.id } });
+    if (!node) return reply.code(404).send({ error: "node not found" });
+    return { impact: await computeNodeImpact(prisma, node.id) };
+  });
+
+  app.post<{ Params: { id: string } }>("/nodes/:id/declare-lost", async (request, reply) => {
+    const user = await requireAdmin(prisma, request, reply);
+    if (!user) return;
+    const node = await prisma.storageNode.findUnique({ where: { id: request.params.id } });
+    if (!node) return reply.code(404).send({ error: "node not found" });
+    if (node.status === StorageNodeStatus.DISABLED) {
+      return reply.code(409).send({ error: "node is disabled" });
+    }
+    const result = await declareNodeLost(prisma, node.id, `manual: admin ${user.id}`);
+    const updated = await prisma.storageNode.findUnique({ where: { id: node.id } });
+    return {
+      node: serializeNode(updated!),
+      ...result,
+      impact: await computeNodeImpact(prisma, node.id)
+    };
+  });
+
+  app.post<{ Params: { id: string } }>("/nodes/:id/restore", async (request, reply) => {
+    const user = await requireAdmin(prisma, request, reply);
+    if (!user) return;
+    const node = await prisma.storageNode.findUnique({ where: { id: request.params.id } });
+    if (!node) return reply.code(404).send({ error: "node not found" });
+    if (node.status !== StorageNodeStatus.LOST) {
+      return reply.code(409).send({ error: "node is not in LOST state" });
+    }
+
+    // Restore semantics:
+    //  - Flip node status back to OFFLINE (next successful probe promotes to ACTIVE).
+    //  - Reset the consecutive-failure counter.
+    //  - For replicas the API marked MISSING when we declared LOST: we don't
+    //    automatically flip them back to AVAILABLE — the periodic verifier
+    //    re-checks them on next read or on next maintenance pass. Admin can
+    //    manually verify via the file-detail health check.
+    //  - However we DO clear lostDeclaredAt so the UI banner goes away.
+    const restored = await prisma.storageNode.update({
+      where: { id: node.id },
+      data: {
+        status: StorageNodeStatus.OFFLINE,
+        consecutiveProbeFailures: 0,
+        lostDeclaredAt: null
+      }
+    });
+    return { node: serializeNode(restored) };
+  });
+
   app.get("/access-logs", async (request, reply) => {
     const user = await requireAdmin(prisma, request, reply);
     if (!user) return;
@@ -2928,6 +2994,100 @@ function serializeStorageLayout(version: {
   };
 }
 
+/**
+ * Per-node storage distribution for a single version. Aggregates whole-file
+ * replica bytes + chunk-replica bytes for each node that holds any piece.
+ *
+ * Output is sorted by bytes desc so the UI can render the biggest holders
+ * first. Each entry includes the node's current status so the UI can flag
+ * "this VPS is currently lost/offline" inline.
+ */
+function serializeStorageDistribution(version: {
+  sizeBytes?: bigint | null;
+  replicas?: Array<{
+    nodeId: string;
+    status: unknown;
+    node: { id: string; name: string; baseUrl: string; status: StorageNodeStatus };
+  }>;
+  chunks?: Array<{
+    ciphertextSizeBytes?: bigint | null;
+    replicas?: Array<{
+      nodeId: string;
+      status: unknown;
+      node: { id: string; name: string; baseUrl: string; status: StorageNodeStatus };
+    }>;
+  }>;
+}) {
+  type Entry = {
+    nodeId: string;
+    nodeName: string;
+    nodeBaseUrl: string;
+    nodeStatus: string;
+    bytes: bigint;
+    wholeReplicaCount: number;
+    chunkReplicaCount: number;
+  };
+  const byNode = new Map<string, Entry>();
+
+  function ensure(node: { id: string; name: string; baseUrl: string; status: StorageNodeStatus }): Entry {
+    let entry = byNode.get(node.id);
+    if (!entry) {
+      entry = {
+        nodeId: node.id,
+        nodeName: node.name,
+        nodeBaseUrl: node.baseUrl,
+        nodeStatus: String(node.status).toLowerCase(),
+        bytes: 0n,
+        wholeReplicaCount: 0,
+        chunkReplicaCount: 0
+      };
+      byNode.set(node.id, entry);
+    }
+    return entry;
+  }
+
+  // Whole-file replicas: each occupies the version's full ciphertext size.
+  const wholeBytes = version.sizeBytes ?? 0n;
+  for (const replica of version.replicas ?? []) {
+    if (String(replica.status).toLowerCase() === "deleted") continue;
+    const entry = ensure(replica.node);
+    entry.bytes += wholeBytes;
+    entry.wholeReplicaCount += 1;
+  }
+
+  // Chunk replicas: each occupies the chunk's individual ciphertext size.
+  for (const chunk of version.chunks ?? []) {
+    const chunkBytes = chunk.ciphertextSizeBytes ?? 0n;
+    for (const replica of chunk.replicas ?? []) {
+      if (String(replica.status).toLowerCase() === "deleted") continue;
+      const entry = ensure(replica.node);
+      entry.bytes += chunkBytes;
+      entry.chunkReplicaCount += 1;
+    }
+  }
+
+  const nodes = Array.from(byNode.values())
+    .map((e) => ({
+      nodeId: e.nodeId,
+      nodeName: e.nodeName,
+      nodeBaseUrl: e.nodeBaseUrl,
+      nodeStatus: e.nodeStatus,
+      bytes: e.bytes.toString(),
+      wholeReplicaCount: e.wholeReplicaCount,
+      chunkReplicaCount: e.chunkReplicaCount
+    }))
+    .sort((a, b) => (BigInt(b.bytes) > BigInt(a.bytes) ? 1 : BigInt(b.bytes) < BigInt(a.bytes) ? -1 : 0));
+
+  return {
+    nodes,
+    nodeCount: nodes.length,
+    // Single-VPS = "all the data lives on one node" — useful for the UI to
+    // flash a warning (no redundancy). Empty distribution counts as single
+    // for display purposes (nothing to redundancy-warn about either way).
+    isSingleNode: nodes.length <= 1
+  };
+}
+
 function serializeMissingStorageLayout() {
   return {
     layout: "whole",
@@ -3295,6 +3455,8 @@ function serializeNode(node: {
   freeBytes: bigint | null;
   totalBytes: bigint | null;
   createdAt: Date;
+  consecutiveProbeFailures?: number;
+  lostDeclaredAt?: Date | null;
 }, health?: { lastError: string | null; healthMessage: string }) {
   return {
     id: node.id,
@@ -3307,7 +3469,94 @@ function serializeNode(node: {
     totalBytes: node.totalBytes?.toString() ?? null,
     lastError: health?.lastError ?? null,
     healthMessage: health?.healthMessage ?? defaultNodeHealthMessage(node.status),
-    createdAt: node.createdAt
+    createdAt: node.createdAt,
+    consecutiveProbeFailures: node.consecutiveProbeFailures ?? 0,
+    lostDeclaredAt: node.lostDeclaredAt ?? null
+  };
+}
+
+/**
+ * Compute the data-loss impact of a single node going down. Surfaces:
+ *  - affectedFiles: how many ACTIVE files have at least one replica on this node
+ *  - replicasOnNode: total live replicas (chunk + whole) on this node
+ *  - unrecoverableFiles: list of files where this node holds the ONLY live
+ *    replica of at least one chunk/version (i.e. losing this node = data loss)
+ *
+ * Used by the UI to show "if this node is gone, here's what you lose" before
+ * the admin clicks "declare lost" (and after, to summarize the damage).
+ */
+async function computeNodeImpact(prisma: PrismaClient, nodeId: string) {
+  // Whole-file replicas on this node (live), with sibling counts.
+  const wholeReplicasOnNode = await prisma.objectReplica.findMany({
+    where: { nodeId, status: { not: ReplicaStatus.DELETED } },
+    include: { version: { include: { file: true, replicas: { include: { node: true } } } } }
+  });
+
+  // Chunk replicas on this node (live), with sibling counts.
+  const chunkReplicasOnNode = await prisma.chunkReplica.findMany({
+    where: { nodeId, status: { not: ReplicaStatus.DELETED } },
+    include: {
+      chunk: {
+        include: {
+          version: { include: { file: true } },
+          replicas: { include: { node: true } }
+        }
+      }
+    }
+  });
+
+  // Per-file aggregation.
+  type FileImpact = { fileId: string; name: string; unrecoverableChunks: number };
+  const fileMap = new Map<string, FileImpact>();
+  const touched = new Set<string>();
+
+  function addUnrecoverable(file: { id: string; name: string }, chunks = 1) {
+    touched.add(file.id);
+    const cur = fileMap.get(file.id) ?? { fileId: file.id, name: file.name, unrecoverableChunks: 0 };
+    cur.unrecoverableChunks += chunks;
+    fileMap.set(file.id, cur);
+  }
+
+  // Helper: is a sibling replica (i.e. not on this node) considered "healthy"
+  // and thus a viable backup if this node disappears? We accept ACTIVE,
+  // DEGRADED, DECOMMISSIONING (data still readable). LOST/OFFLINE/DISABLED don't count.
+  const isViableSibling = (r: { status: ReplicaStatus; node: { status: StorageNodeStatus } }) =>
+    r.status === ReplicaStatus.AVAILABLE &&
+    (r.node.status === StorageNodeStatus.ACTIVE ||
+      r.node.status === StorageNodeStatus.DEGRADED ||
+      r.node.status === StorageNodeStatus.DECOMMISSIONING);
+
+  for (const replica of wholeReplicasOnNode) {
+    const file = replica.version.file;
+    if (file.status !== FileStatus.ACTIVE) continue;
+    touched.add(file.id);
+    const otherViable = replica.version.replicas.some((r) => r.nodeId !== nodeId && isViableSibling(r));
+    if (!otherViable) {
+      addUnrecoverable({ id: file.id, name: file.name });
+    }
+  }
+
+  for (const replica of chunkReplicasOnNode) {
+    const file = replica.chunk.version.file;
+    if (file.status !== FileStatus.ACTIVE) continue;
+    touched.add(file.id);
+    const otherViable = replica.chunk.replicas.some((r) => r.nodeId !== nodeId && isViableSibling(r));
+    if (!otherViable) {
+      addUnrecoverable({ id: file.id, name: file.name });
+    }
+  }
+
+  const unrecoverable = Array.from(fileMap.values()).sort((a, b) => b.unrecoverableChunks - a.unrecoverableChunks);
+
+  return {
+    nodeId,
+    replicasOnNode: wholeReplicasOnNode.length + chunkReplicasOnNode.length,
+    affectedFiles: touched.size,
+    unrecoverableFileCount: unrecoverable.length,
+    // Cap the per-file list at 50 so a catastrophic node-loss doesn't blow up
+    // the payload. UI can show "and N more…" if truncated.
+    unrecoverableFiles: unrecoverable.slice(0, 50),
+    truncated: unrecoverable.length > 50
   };
 }
 

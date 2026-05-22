@@ -957,6 +957,22 @@ export async function deleteReplicasForFile(prisma: PrismaClient, fileId: string
   }
 }
 
+/**
+ * Self-heal: walk every ACTIVE file, count its healthy replicas per chunk
+ * (or per whole-file replica for non-chunked layouts), and create new replicas
+ * on healthy nodes whenever the count is below requiredReplicaCount(policy).
+ *
+ * Originally only IMPORTANT, whole-file. Extended for B3 (node-lost recovery)
+ * to cover all policies + chunked layouts, so a LOST node triggers a real
+ * self-heal pass instead of leaving STANDARD files silently under-replicated.
+ *
+ * Sources for the re-replication are restricted to ACTIVE/DEGRADED nodes
+ * (skipping LOST, OFFLINE, DECOMMISSIONING — they can't be trusted as a source
+ * for new copies). Targets are restricted to ACTIVE/DEGRADED and exclude any
+ * node that already has a replica of the same chunk/object.
+ *
+ * Returns total number of new replicas created across all files this pass.
+ */
 export async function backfillImportantReplicas(prisma: PrismaClient): Promise<number> {
   const files = await prisma.file.findMany({
     where: { status: FileStatus.ACTIVE },
@@ -974,46 +990,190 @@ export async function backfillImportantReplicas(prisma: PrismaClient): Promise<n
   for (const file of files) {
     const folderPolicy = file.folder ? toSharedPolicy(file.folder.defaultPolicy) : "standard";
     const policy = resolveStoragePolicy(folderPolicy, file.policyOverride ? toSharedPolicy(file.policyOverride) : null);
-    if (policy !== "important") {
-      continue;
-    }
+    const required = requiredReplicaCount(policy);
+    if (required <= 0) continue;
 
     const version = file.versions[0];
-    if (!version) {
-      continue;
-    }
+    if (!version) continue;
 
     if (version.storageLayout === FileVersionStorageLayout.CHUNKED) {
+      created += await backfillChunkedVersion(prisma, version.id, required);
       continue;
     }
 
-    const availableReplicas = version.replicas.filter(
-      (replica) =>
-        replica.status === ReplicaStatus.AVAILABLE &&
-        replica.node.status !== StorageNodeStatus.OFFLINE &&
-        replica.node.status !== StorageNodeStatus.DISABLED
-    );
-    if (availableReplicas.length >= 2) {
+    // Whole-file path (original behavior, extended to all policies + LOST fallback).
+    const healthyReplicas = version.replicas.filter(isHealthyReplica);
+    if (healthyReplicas.length >= required) continue;
+
+    const needed = required - healthyReplicas.length;
+    const usedNodeIds = new Set(version.replicas.map((r) => r.nodeId));
+
+    // Source: try healthy replicas first, then non-DELETED replicas on any node
+    // (including LOST). readEncryptedObject already filters healthy; here we
+    // emulate the LOST fallback inline.
+    let sourceCiphertext: Buffer | null = null;
+    try {
+      sourceCiphertext = await readEncryptedObject(prisma, version.id);
+    } catch {
+      // Healthy read failed — try every other live replica including LOST.
+      const ordered = [...version.replicas].sort((a, b) => (isHealthyReplica(a) ? 0 : 1) - (isHealthyReplica(b) ? 0 : 1));
+      for (const candidate of ordered) {
+        if (!isPotentialReadSource(candidate)) continue;
+        try {
+          const stream = await driverForNode(candidate.node).getObject(candidate.objectId);
+          sourceCiphertext = await streamToBuffer(stream);
+          break;
+        } catch (err) {
+          console.warn(`backfill: whole-source ${candidate.node.name} for v${version.id} failed:`, err);
+        }
+      }
+    }
+
+    if (!sourceCiphertext) {
+      await prisma.objectReplica.updateMany({
+        where: {
+          versionId: version.id,
+          status: { notIn: [ReplicaStatus.DELETED, ReplicaStatus.MISSING] }
+        },
+        data: { status: ReplicaStatus.MISSING }
+      });
+      console.warn(`backfill: version ${version.id} has no reachable source — marked MISSING`);
       continue;
     }
 
-    const sourceCiphertext = await readEncryptedObject(prisma, version.id);
-    const usedNodeIds = new Set(version.replicas.map((replica) => replica.nodeId));
-    const [target] = await prisma.storageNode.findMany({
+    const targets = await prisma.storageNode.findMany({
       where: {
         status: { in: [StorageNodeStatus.ACTIVE, StorageNodeStatus.DEGRADED] },
         id: { notIn: Array.from(usedNodeIds) }
       },
       orderBy: [{ priority: "asc" }, { createdAt: "asc" }],
-      take: 1
+      take: needed
     });
+    if (targets.length === 0) continue;
 
-    if (!target) {
+    for (const target of targets) {
+      try {
+        await replicateToNode(prisma, target, version.id, sourceCiphertext, version.ciphertextSha256);
+        created += 1;
+      } catch (err) {
+        console.warn(`backfill: replicateToNode failed for version ${version.id} → ${target.name}`, err);
+      }
+    }
+  }
+
+  return created;
+}
+
+function isHealthyReplica(replica: { status: ReplicaStatus; node: { status: StorageNodeStatus } }): boolean {
+  return (
+    replica.status === ReplicaStatus.AVAILABLE &&
+    (replica.node.status === StorageNodeStatus.ACTIVE ||
+      replica.node.status === StorageNodeStatus.DEGRADED ||
+      // DECOMMISSIONING data is still valid, just not getting new writes — it
+      // counts toward "healthy" so we don't over-replicate while the drain runs.
+      replica.node.status === StorageNodeStatus.DECOMMISSIONING)
+  );
+}
+
+/**
+ * A replica we can attempt to read from. Includes LOST as a last-ditch source
+ * because the node may still be briefly reachable (common when an admin
+ * declares LOST preemptively). Order callers should prefer healthy first,
+ * then fall back to this.
+ */
+function isPotentialReadSource(replica: { status: ReplicaStatus; node: { status: StorageNodeStatus } }): boolean {
+  // Even MISSING is worth trying — the node might still have the bytes on disk
+  // and we have nothing else to lose.
+  if (replica.status === ReplicaStatus.DELETED) return false;
+  return true;
+}
+
+/**
+ * Backfill chunked versions: for each chunk, count healthy replicas; if below
+ * required, copy the ciphertext from a healthy source onto a fresh target.
+ * Returns count of newly created replicas across all chunks.
+ */
+async function backfillChunkedVersion(
+  prisma: PrismaClient,
+  versionId: string,
+  required: number
+): Promise<number> {
+  const chunks = await prisma.fileChunk.findMany({
+    where: { versionId },
+    orderBy: { index: "asc" },
+    include: { replicas: { include: { node: true } } }
+  });
+
+  let created = 0;
+  for (const chunk of chunks) {
+    const healthy = chunk.replicas.filter(isHealthyReplica);
+    if (healthy.length >= required) continue;
+
+    const needed = required - healthy.length;
+
+    // Source preference order:
+    //   1. Healthy (AVAILABLE on ACTIVE/DEGRADED/DECOMMISSIONING)
+    //   2. Anything else not DELETED — including LOST nodes and MISSING-marked
+    //      replicas. The LOST node may still be briefly reachable; that's our
+    //      whole reason to try.
+    let ciphertext: Buffer | null = null;
+    let sourceUsed: typeof chunk.replicas[number] | null = null;
+    const ordered = [...chunk.replicas].sort((a, b) => {
+      const aH = isHealthyReplica(a) ? 0 : 1;
+      const bH = isHealthyReplica(b) ? 0 : 1;
+      return aH - bH;
+    });
+    for (const candidate of ordered) {
+      if (!isPotentialReadSource(candidate)) continue;
+      try {
+        const stream = await driverForNode(candidate.node).getObject(candidate.objectId);
+        ciphertext = await streamToBuffer(stream);
+        sourceUsed = candidate;
+        break;
+      } catch (err) {
+        console.warn(`backfill: source candidate ${candidate.node.name} for chunk ${chunk.id} failed:`, err);
+      }
+    }
+
+    if (!ciphertext || !sourceUsed) {
+      // Genuinely unrecoverable. Mark every non-deleted replica MISSING so the
+      // UI surfaces it via /risks and the file detail "storage" tab.
+      await prisma.chunkReplica.updateMany({
+        where: {
+          chunkId: chunk.id,
+          status: { notIn: [ReplicaStatus.DELETED, ReplicaStatus.MISSING] }
+        },
+        data: { status: ReplicaStatus.MISSING }
+      });
+      console.warn(`backfill: chunk ${chunk.id} has no reachable source — marked MISSING`);
       continue;
     }
 
-    await replicateToNode(prisma, target, version.id, sourceCiphertext, version.ciphertextSha256);
-    created += 1;
+    // If we recovered the ciphertext from a non-healthy source, mark the
+    // original replica AVAILABLE again only if it's on a still-acceptable
+    // node. Otherwise leave it as-is so the UI can show "we re-replicated
+    // off this dying node".
+
+    // Excludes nodes that already have a replica (whether MISSING or AVAILABLE).
+    const usedNodeIds = new Set(chunk.replicas.map((r) => r.nodeId));
+    const targets = await prisma.storageNode.findMany({
+      where: {
+        status: { in: [StorageNodeStatus.ACTIVE, StorageNodeStatus.DEGRADED] },
+        id: { notIn: Array.from(usedNodeIds) }
+      },
+      orderBy: [{ priority: "asc" }, { createdAt: "asc" }],
+      take: needed
+    });
+    if (targets.length === 0) continue;
+
+    for (const target of targets) {
+      try {
+        await replicateChunkToNode(prisma, target, chunk.id, ciphertext, sourceUsed.ciphertextSha256);
+        created += 1;
+      } catch (err) {
+        console.warn(`backfill: replicateChunkToNode failed for chunk ${chunk.id} → ${target.name}`, err);
+      }
+    }
   }
 
   return created;

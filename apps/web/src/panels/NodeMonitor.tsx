@@ -1,6 +1,6 @@
-import { Activity, AlertTriangle, ArrowLeft, ChevronDown, RefreshCw } from "lucide-react";
+import { Activity, AlertTriangle, ArrowLeft, ChevronDown, RefreshCw, RotateCcw, Skull } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
-import { api, type NodeItem } from "../api.js";
+import { api, type NodeImpact, type NodeItem } from "../api.js";
 import { Dialog } from "../components/Dialog.js";
 import { formatBytes, formatDateTime, nodeStatusLabel } from "../lib/format.js";
 
@@ -156,9 +156,201 @@ export function NodeMonitorView({
         <ChevronDown size={14} className="muted" style={{ transform: "rotate(-90deg)" }} />
       </section>
 
-      {/* Decommission section */}
-      <DecommissionSection node={node} toastError={toastError} onChanged={() => load(range)} />
+      {/* Lost / decommission section */}
+      {node.status === "lost"
+        ? <LostSection node={node} toastError={toastError} onChanged={() => load(range)} />
+        : <DecommissionSection node={node} toastError={toastError} onChanged={() => load(range)} />}
+
+      {/* "Declare lost" appears whenever the node isn't already lost/disabled — manual override
+          for the case where the admin knows the VPS is gone for good. */}
+      {node.status !== "lost" && node.status !== "disabled" && node.status !== "decommissioning" && (
+        <DeclareLostSection node={node} toastError={toastError} onChanged={() => load(range)} />
+      )}
     </div>
+  );
+}
+
+// ---- declare-lost (manual) UI ----
+
+function DeclareLostSection({
+  node,
+  toastError,
+  onChanged
+}: {
+  node: NodeItem;
+  toastError: (m: string) => void;
+  onChanged: () => Promise<void> | void;
+}) {
+  const [impact, setImpact] = useState<NodeImpact | null>(null);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  // Lazy-load impact when the section first mounts so the danger zone shows
+  // "if this node disappears, you lose X files" upfront.
+  useEffect(() => {
+    let cancelled = false;
+    api<{ impact: NodeImpact }>(`/nodes/${node.id}/impact`)
+      .then((res) => { if (!cancelled) setImpact(res.impact); })
+      .catch(() => { /* ignore */ });
+    return () => { cancelled = true; };
+  }, [node.id]);
+
+  async function declareLost() {
+    setBusy(true);
+    try {
+      await api(`/nodes/${node.id}/declare-lost`, { method: "POST", body: "{}" });
+      setConfirmOpen(false);
+      await onChanged();
+    } catch (err) {
+      toastError(err instanceof Error ? err.message : "标记失联失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="card card-pad stack-sm" style={{ borderColor: "var(--border)" }}>
+      <div className="row" style={{ gap: 8 }}>
+        <Skull size={16} className="muted" />
+        <strong style={{ fontSize: 13 }}>已知 VPS 跑路 / 永久下线?</strong>
+      </div>
+      <p className="muted" style={{ fontSize: 12, lineHeight: 1.6 }}>
+        如果你确定这台 VPS 不会回来(欠费、被回收、跑路),可以直接标记为「失联」。
+        系统会立刻把这台节点上的副本标记为缺失,并尝试从其他节点补副本。
+        正常情况下,系统会在连续 10 次探测失败后自动这么做(约 5 分钟)。
+      </p>
+      {impact && (
+        <p style={{ fontSize: 12, lineHeight: 1.6, margin: 0 }}>
+          <strong>影响:</strong>本节点上有 <strong>{impact.replicasOnNode}</strong> 个副本,
+          涉及 <strong>{impact.affectedFiles}</strong> 个文件。
+          其中 <strong style={{ color: impact.unrecoverableFileCount > 0 ? "var(--danger)" : "var(--good)" }}>
+            {impact.unrecoverableFileCount}
+          </strong> 个文件没有其他备份(失联后无法恢复)。
+        </p>
+      )}
+      <button
+        type="button"
+        className="btn btn-ghost btn-sm"
+        onClick={() => setConfirmOpen(true)}
+        disabled={busy}
+        style={{ alignSelf: "flex-start", color: "var(--danger)" }}
+      >
+        <Skull size={12} /> 立即标记失联
+      </button>
+      {confirmOpen && (
+        <Dialog
+          title="确认标记节点失联"
+          icon={<Skull size={16} style={{ color: "var(--danger)", marginRight: 8 }} />}
+          onClose={() => !busy && setConfirmOpen(false)}
+          footer={
+            <>
+              <button type="button" className="btn btn-ghost" onClick={() => setConfirmOpen(false)} disabled={busy}>取消</button>
+              <button type="button" className="btn btn-danger" onClick={declareLost} disabled={busy}>
+                {busy && <span className="spinner" />} 确认,标记失联
+              </button>
+            </>
+          }
+        >
+          <div className="stack-sm">
+            <p>即将把节点 <strong>{node.name}</strong> 标记为「失联」。</p>
+            {impact && impact.unrecoverableFileCount > 0 && (
+              <div className="alert alert-danger" style={{ fontSize: 12 }}>
+                ⚠ <strong>{impact.unrecoverableFileCount}</strong> 个文件失去全部副本,将无法恢复。
+                {impact.unrecoverableFiles.length > 0 && (
+                  <ul style={{ margin: "6px 0 0 18px", padding: 0, fontSize: 11 }}>
+                    {impact.unrecoverableFiles.slice(0, 10).map((f) => (
+                      <li key={f.fileId}>{f.name}</li>
+                    ))}
+                    {impact.unrecoverableFiles.length > 10 && <li>… 还有 {impact.unrecoverableFiles.length - 10} 个</li>}
+                  </ul>
+                )}
+              </div>
+            )}
+            <ul style={{ paddingLeft: 18, fontSize: 13, lineHeight: 1.8 }}>
+              <li>立即把这台节点的副本全部标记 MISSING</li>
+              <li>触发自愈:其他节点尚有副本的文件,会自动补副本到健康节点</li>
+              <li>如果是误判,可以在节点列表点击「恢复」</li>
+            </ul>
+          </div>
+        </Dialog>
+      )}
+    </section>
+  );
+}
+
+// ---- LOST status section: shown when node is already LOST ----
+
+function LostSection({
+  node,
+  toastError,
+  onChanged
+}: {
+  node: NodeItem;
+  toastError: (m: string) => void;
+  onChanged: () => Promise<void> | void;
+}) {
+  const [impact, setImpact] = useState<NodeImpact | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    api<{ impact: NodeImpact }>(`/nodes/${node.id}/impact`)
+      .then((res) => { if (!cancelled) setImpact(res.impact); })
+      .catch(() => { /* ignore */ });
+    return () => { cancelled = true; };
+  }, [node.id]);
+
+  async function restore() {
+    setBusy(true);
+    try {
+      await api(`/nodes/${node.id}/restore`, { method: "POST", body: "{}" });
+      await onChanged();
+    } catch (err) {
+      toastError(err instanceof Error ? err.message : "恢复节点失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="card card-pad stack-sm" style={{ borderColor: "var(--danger)", background: "color-mix(in srgb, var(--danger-soft) 40%, transparent)" }}>
+      <div className="row" style={{ gap: 8 }}>
+        <Skull size={16} color="var(--danger)" />
+        <strong style={{ fontSize: 13, color: "var(--danger)" }}>节点已失联</strong>
+      </div>
+      <p className="muted" style={{ fontSize: 12, lineHeight: 1.6 }}>
+        {node.lostDeclaredAt
+          ? `失联时间:${new Date(node.lostDeclaredAt).toLocaleString()}`
+          : "失联时间未知"}
+        。系统已自动尝试从其他节点重建副本。
+      </p>
+      {impact && (
+        <div className="stack-sm" style={{ fontSize: 12 }}>
+          <p style={{ margin: 0 }}>
+            <strong>影响:</strong>{impact.replicasOnNode} 个副本(涉及 {impact.affectedFiles} 个文件),
+            其中 <strong style={{ color: impact.unrecoverableFileCount > 0 ? "var(--danger)" : "var(--good)" }}>
+              {impact.unrecoverableFileCount}
+            </strong> 个文件失去全部副本,无法恢复。
+          </p>
+          {impact.unrecoverableFiles.length > 0 && (
+            <details>
+              <summary style={{ cursor: "pointer", fontSize: 12 }}>查看受影响文件清单</summary>
+              <ul style={{ margin: "6px 0 0 18px", padding: 0, fontSize: 11, lineHeight: 1.8 }}>
+                {impact.unrecoverableFiles.map((f) => (
+                  <li key={f.fileId}>{f.name}{f.unrecoverableChunks > 1 && ` (缺 ${f.unrecoverableChunks} 块)`}</li>
+                ))}
+                {impact.truncated && <li className="muted">… 列表已截断,共 {impact.unrecoverableFileCount} 个</li>}
+              </ul>
+            </details>
+          )}
+        </div>
+      )}
+      <div className="row" style={{ gap: 6 }}>
+        <button type="button" className="btn btn-ghost btn-sm" onClick={restore} disabled={busy}>
+          <RotateCcw size={12} /> {busy ? "恢复中…" : "节点回来了,恢复"}
+        </button>
+      </div>
+    </section>
   );
 }
 

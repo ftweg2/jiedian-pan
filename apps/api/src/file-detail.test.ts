@@ -158,6 +158,8 @@ function makeNode(overrides: Partial<StorageNode>): StorageNode {
     lastSeenAt: now,
     freeBytes: 900n,
     totalBytes: 1000n,
+    consecutiveProbeFailures: 0,
+    lostDeclaredAt: null,
     createdAt: now,
     updatedAt: now,
     ...overrides

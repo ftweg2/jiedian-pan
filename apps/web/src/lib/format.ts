@@ -41,6 +41,7 @@ export function nodeStatusLabel(status: NodeItem["status"]): string {
     degraded: "降级",
     offline: "离线",
     decommissioning: "下线中",
+    lost: "失联",
     disabled: "停用"
   };
   return map[status] ?? status;

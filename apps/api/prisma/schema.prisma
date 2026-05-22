@@ -44,6 +44,12 @@ enum StorageNodeStatus {
   DEGRADED        @map("degraded")
   OFFLINE         @map("offline")
   DECOMMISSIONING @map("decommissioning")
+  // Set after the prober has seen the node unreachable for too many consecutive
+  // probes (default 10 × 30s ≈ 5 min). All replicas on this node are treated
+  // as MISSING; self-heal kicks off for any file that drops below its required
+  // replica count. Admin can manually flip it back via /restore if the VPS comes
+  // back, or just leave it as evidence that data was lost.
+  LOST            @map("lost")
   DISABLED        @map("disabled")
 }
 
@@ -158,21 +164,28 @@ model FileVersion {
 }
 
 model StorageNode {
-  id              String            @id @default(cuid())
-  name            String
-  baseUrl         String
-  agentToken      String
-  status          StorageNodeStatus @default(ACTIVE)
-  priority        Int               @default(100)
-  lastSeenAt      DateTime?
-  freeBytes       BigInt?
-  totalBytes      BigInt?
-  createdAt       DateTime          @default(now())
-  updatedAt       DateTime          @updatedAt
-  replicas        ObjectReplica[]
-  chunkReplicas   ChunkReplica[]
-  accessLogs      AccessLog[]
-  probes          NodeProbe[]
+  id                          String            @id @default(cuid())
+  name                        String
+  baseUrl                     String
+  agentToken                  String
+  status                      StorageNodeStatus @default(ACTIVE)
+  priority                    Int               @default(100)
+  lastSeenAt                  DateTime?
+  freeBytes                   BigInt?
+  totalBytes                  BigInt?
+  // Number of consecutive failed probes since the last successful one. Reset
+  // to 0 on a successful probe. Used to declare LOST when it crosses the
+  // configured threshold (NODE_LOST_PROBE_THRESHOLD, default 10).
+  consecutiveProbeFailures    Int               @default(0)
+  // Timestamp when the node was declared LOST (either by the prober or by an
+  // admin via POST /nodes/:id/declare-lost). Cleared by /restore.
+  lostDeclaredAt              DateTime?
+  createdAt                   DateTime          @default(now())
+  updatedAt                   DateTime          @updatedAt
+  replicas                    ObjectReplica[]
+  chunkReplicas               ChunkReplica[]
+  accessLogs                  AccessLog[]
+  probes                      NodeProbe[]
 
   @@index([status, priority])
 }

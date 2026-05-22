@@ -67,6 +67,7 @@ function normalizeFileDetail(response: FileDetailResponse, fallback: FileItem): 
     latestVersion: normalizedVersion,
     versions: normalizeVersionList(response.versions, normalizedVersion),
     storageLayout: normalizeStorageLayout(response.storageLayout ?? responseFile.storageLayout ?? null, responseFile),
+    storageDistribution: response.storageDistribution ?? null,
     chunks: response.chunks?.map(normalizeChunkDetail) ?? [],
     shareSummary: response.shareSummary ?? (response.shares ? summarizeShareLinks(response.shares) : null),
     recentAccess: normalizeAccessSummary(response.recentAccess ?? response.accessSummary ?? null),
