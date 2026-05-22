@@ -21,6 +21,29 @@ export function startBackgroundJobs(prisma: PrismaClient, intervalMs = 60_000): 
   return timer;
 }
 
+// Lets request handlers (e.g. POST /nodes/:id/decommission) kick a drain
+// immediately so admins don't have to wait for the next 60s maintenance tick.
+// Coalesces concurrent calls so we don't pile up drain runs.
+let drainRunning = false;
+let drainPending = false;
+export function kickDrain(prisma: PrismaClient): void {
+  if (drainRunning) {
+    drainPending = true;
+    return;
+  }
+  drainRunning = true;
+  drainDecommissioningNodes(prisma)
+    .catch((error) => console.error("kicked drain failed", error))
+    .finally(() => {
+      drainRunning = false;
+      if (drainPending) {
+        drainPending = false;
+        // Schedule next pass async so we yield event loop between batches.
+        setImmediate(() => kickDrain(prisma));
+      }
+    });
+}
+
 export async function runMaintenance(prisma: PrismaClient): Promise<void> {
   const now = new Date();
   await prisma.shareLink.updateMany({
@@ -71,6 +94,8 @@ async function drainDecommissioningNodes(prisma: PrismaClient): Promise<void> {
   const draining = await prisma.storageNode.findMany({
     where: { status: StorageNodeStatus.DECOMMISSIONING }
   });
+  if (draining.length === 0) return;
+  console.info(`drain: found ${draining.length} decommissioning node(s)`);
   for (const node of draining) {
     await drainOneNode(prisma, node);
   }
@@ -100,6 +125,7 @@ async function drainOneNode(
     include: { chunk: { include: { replicas: true } } },
     take: DECOMMISSION_CHUNKS_PER_TICK
   });
+  console.info(`drain ${node.name}: ${chunkReplicas.length} chunk replica(s) this tick`);
   for (const replica of chunkReplicas) {
     await migrateChunkReplica(prisma, sourceDriver, replica, targets);
   }
@@ -109,6 +135,9 @@ async function drainOneNode(
     include: { version: { include: { replicas: true } } },
     take: DECOMMISSION_CHUNKS_PER_TICK
   });
+  if (objectReplicas.length > 0) {
+    console.info(`drain ${node.name}: ${objectReplicas.length} whole-file replica(s) this tick`);
+  }
   for (const replica of objectReplicas) {
     await migrateWholeReplica(prisma, sourceDriver, replica, targets);
   }

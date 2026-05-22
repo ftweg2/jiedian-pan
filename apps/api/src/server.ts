@@ -40,6 +40,7 @@ import {
 import type { ApiEnv } from "./env.js";
 import { toDbPermission, toDbPolicy, toSharedPolicy } from "./mappers.js";
 import { canAccessFile, canAccessFolder } from "./permissions.js";
+import { kickDrain } from "./cleanup.js";
 import {
   CHUNK_SIZE_BYTES,
   chunkedVersionHasPerChunkEncryption,
@@ -85,8 +86,23 @@ export async function buildServer(env: ApiEnv, prisma: PrismaClient) {
 
   startSessionPruner();
 
-  app.setErrorHandler((error, _request, reply) => {
+  app.setErrorHandler((error, request, reply) => {
     const message = error instanceof Error ? error.message : String(error);
+
+    // Always log the original error — otherwise problems that happen AFTER a
+    // route set content-type (e.g. a streamed download throwing mid-flight)
+    // can be hidden by Fastify's "invalid payload type" follow-up error.
+    request.log.error({ err: error }, "request failed in handler");
+
+    // If the route already set content-type to something non-JSON (e.g.
+    // application/octet-stream for a download that then threw), reply.send
+    // of a JSON object would itself blow up with FST_ERR_REP_INVALID_PAYLOAD_TYPE.
+    // Reset to JSON so the client gets a usable error response.
+    if (!reply.sent) {
+      reply.header("content-type", "application/json; charset=utf-8");
+      reply.removeHeader("content-length");
+      reply.removeHeader("content-disposition");
+    }
 
     if (error instanceof z.ZodError) {
       return reply.code(400).send({ error: error.issues.map((issue) => issue.message).join("; ") });
@@ -1912,6 +1928,10 @@ export async function buildServer(env: ApiEnv, prisma: PrismaClient) {
       where: { id: node.id },
       data: { status: StorageNodeStatus.DECOMMISSIONING }
     });
+    // Don't wait 60s for the next maintenance tick — start draining now so
+    // small datasets are migrated within seconds of the admin clicking the
+    // button. Runs in the background; the GET /migration poller surfaces progress.
+    kickDrain(prisma);
     return { node: serializeNode(updated), already: false };
   });
 

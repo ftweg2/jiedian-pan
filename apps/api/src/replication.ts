@@ -790,7 +790,8 @@ async function readWholeEncryptedObject(prisma: PrismaClient, versionId: string)
     where: {
       versionId,
       status: ReplicaStatus.AVAILABLE,
-      node: { status: { in: [StorageNodeStatus.ACTIVE, StorageNodeStatus.DEGRADED] } }
+      // Allow reads from DECOMMISSIONING nodes — data is still live until drained.
+      node: { status: { in: [StorageNodeStatus.ACTIVE, StorageNodeStatus.DEGRADED, StorageNodeStatus.DECOMMISSIONING] } }
     },
     include: { node: true },
     orderBy: [{ verifiedAt: "desc" }, { createdAt: "asc" }]
@@ -884,7 +885,10 @@ async function loadReadableChunks(prisma: PrismaClient, versionId: string) {
       replicas: {
         where: {
           status: ReplicaStatus.AVAILABLE,
-          node: { status: { in: [StorageNodeStatus.ACTIVE, StorageNodeStatus.DEGRADED] } }
+          // DECOMMISSIONING nodes are not write targets, but their data is still
+          // valid and reachable until the drain finishes. Excluding them here
+          // would brick reads for any chunk that hasn't been migrated yet.
+          node: { status: { in: [StorageNodeStatus.ACTIVE, StorageNodeStatus.DEGRADED, StorageNodeStatus.DECOMMISSIONING] } }
         },
         include: { node: true },
         orderBy: [{ verifiedAt: "desc" }, { createdAt: "asc" }]
