@@ -1192,7 +1192,11 @@ export async function reverifyNodeMissingReplicas(
   node: StorageNode,
   options: { maxReplicas?: number; concurrency?: number } = {}
 ): Promise<{ checked: number; chunkRecovered: number; chunkStillMissing: number; objectRecovered: number; objectStillMissing: number }> {
-  const maxReplicas = options.maxReplicas ?? Infinity;
+  // undefined = no limit (admin endpoint). Prisma doesn't accept Infinity
+  // for `take`; we must omit the field entirely. A finite cap is used by the
+  // prober / maintenance pass to bound work per tick.
+  const limited = typeof options.maxReplicas === "number" && Number.isFinite(options.maxReplicas);
+  const maxReplicas = limited ? Math.max(0, Math.floor(options.maxReplicas as number)) : null;
   const concurrency = options.concurrency ?? 6;
 
   // Skip nodes that aren't reachable (no point calling verify).
@@ -1200,20 +1204,21 @@ export async function reverifyNodeMissingReplicas(
     return { checked: 0, chunkRecovered: 0, chunkStillMissing: 0, objectRecovered: 0, objectStillMissing: 0 };
   }
 
-  const chunkBudget = Math.max(0, Math.floor(maxReplicas));
   const chunkMissing = await prisma.chunkReplica.findMany({
     where: { nodeId: node.id, status: ReplicaStatus.MISSING },
     select: { id: true, objectId: true, ciphertextSha256: true },
-    take: chunkBudget,
-    orderBy: { createdAt: "asc" }
+    orderBy: { createdAt: "asc" },
+    ...(maxReplicas != null ? { take: maxReplicas } : {})
   });
-  const objectBudget = Math.max(0, chunkBudget - chunkMissing.length);
-  const objectMissing = objectBudget > 0 ? await prisma.objectReplica.findMany({
-    where: { nodeId: node.id, status: ReplicaStatus.MISSING },
-    select: { id: true, objectId: true, ciphertextSha256: true },
-    take: objectBudget,
-    orderBy: { createdAt: "asc" }
-  }) : [];
+  const objectTake = maxReplicas != null ? Math.max(0, maxReplicas - chunkMissing.length) : null;
+  const objectMissing = (objectTake == null || objectTake > 0)
+    ? await prisma.objectReplica.findMany({
+        where: { nodeId: node.id, status: ReplicaStatus.MISSING },
+        select: { id: true, objectId: true, ciphertextSha256: true },
+        orderBy: { createdAt: "asc" },
+        ...(objectTake != null ? { take: objectTake } : {})
+      })
+    : [];
 
   if (chunkMissing.length === 0 && objectMissing.length === 0) {
     return { checked: 0, chunkRecovered: 0, chunkStillMissing: 0, objectRecovered: 0, objectStillMissing: 0 };
