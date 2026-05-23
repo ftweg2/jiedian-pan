@@ -1,4 +1,4 @@
-import { KeyRound, Plus, UserCheck, UserX } from "lucide-react";
+import { KeyRound, Plus, Trash2, UserCheck, UserX } from "lucide-react";
 import { useState, type FormEvent } from "react";
 import { api, type SessionUser } from "../api.js";
 import { Dialog } from "../components/Dialog.js";
@@ -6,12 +6,14 @@ import { EmptyState, TableState } from "../components/Empty.js";
 import { isUserDisabled, stage8ErrorMessage } from "../lib/errors.js";
 
 export function UsersPanel({
+  currentUserId,
   users,
   loading,
   reload,
   toastSuccess,
   toastError
 }: {
+  currentUserId: string;
   users: SessionUser[];
   loading: boolean;
   reload: () => Promise<void>;
@@ -20,6 +22,7 @@ export function UsersPanel({
 }) {
   const [createOpen, setCreateOpen] = useState(false);
   const [resetTarget, setResetTarget] = useState<SessionUser | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<SessionUser | null>(null);
   const [actionId, setActionId] = useState<string | null>(null);
 
   async function setEnabled(user: SessionUser, enabled: boolean) {
@@ -30,6 +33,26 @@ export function UsersPanel({
       toastSuccess(enabled ? `${user.email} 已启用` : `${user.email} 已停用`);
     } catch (err) {
       toastError(stage8ErrorMessage(err, enabled ? "启用用户" : "停用用户"));
+    } finally {
+      setActionId(null);
+    }
+  }
+
+  async function confirmDelete(user: SessionUser) {
+    setActionId(user.id);
+    try {
+      const res = await api<{ deleted: boolean; transferredFiles: number; transferredFolders: number }>(
+        `/users/${user.id}`,
+        { method: "DELETE" }
+      );
+      await reload();
+      const xfer = res.transferredFiles + res.transferredFolders;
+      toastSuccess(xfer > 0
+        ? `已删除 ${user.email},接管了 ${res.transferredFiles} 个文件 + ${res.transferredFolders} 个文件夹`
+        : `已删除 ${user.email}`);
+      setDeleteTarget(null);
+    } catch (err) {
+      toastError(stage8ErrorMessage(err, "删除用户"));
     } finally {
       setActionId(null);
     }
@@ -68,9 +91,16 @@ export function UsersPanel({
                       <KeyRound size={12} /> 重置密码
                     </button>
                     {disabled ? (
-                      <button type="button" className="btn btn-ghost btn-sm" onClick={() => setEnabled(user, true)} disabled={actionId === user.id}>
-                        <UserCheck size={12} /> 启用
-                      </button>
+                      <>
+                        <button type="button" className="btn btn-ghost btn-sm" onClick={() => setEnabled(user, true)} disabled={actionId === user.id}>
+                          <UserCheck size={12} /> 启用
+                        </button>
+                        {user.id !== currentUserId && (
+                          <button type="button" className="btn btn-danger-ghost btn-sm" onClick={() => setDeleteTarget(user)} disabled={actionId === user.id}>
+                            <Trash2 size={12} /> 删除
+                          </button>
+                        )}
+                      </>
                     ) : (
                       <button type="button" className="btn btn-danger-ghost btn-sm" onClick={() => setEnabled(user, false)} disabled={actionId === user.id}>
                         <UserX size={12} /> 停用
@@ -98,6 +128,33 @@ export function UsersPanel({
           onSuccess={() => toastSuccess(`${resetTarget.email} 密码已重置`)}
           onError={toastError}
         />
+      )}
+      {deleteTarget && (
+        <Dialog
+          title={`删除用户 — ${deleteTarget.email}`}
+          onClose={() => actionId !== deleteTarget.id && setDeleteTarget(null)}
+          footer={
+            <>
+              <button type="button" className="btn btn-ghost" onClick={() => setDeleteTarget(null)} disabled={actionId === deleteTarget.id}>取消</button>
+              <button type="button" className="btn btn-danger" onClick={() => confirmDelete(deleteTarget)} disabled={actionId === deleteTarget.id}>
+                {actionId === deleteTarget.id && <span className="spinner" />} 确认删除
+              </button>
+            </>
+          }
+        >
+          <div className="stack-sm">
+            <p>这个操作 <strong>不可撤销</strong>:</p>
+            <ul style={{ paddingLeft: 18, fontSize: 13, lineHeight: 1.7, margin: 0 }}>
+              <li>用户账号 <strong>{deleteTarget.email}</strong> 会被永久删除</li>
+              <li>该用户所有 <strong>文件</strong> 和 <strong>文件夹</strong> 会转移给你(当前管理员)</li>
+              <li>会话、权限授予会一并删除</li>
+              <li>访问日志保留,但归属者会变成"已删除用户"</li>
+            </ul>
+            <p className="muted" style={{ fontSize: 12 }}>
+              如果只是临时不允许登录,用「停用」就够了 — 不必删。
+            </p>
+          </div>
+        </Dialog>
       )}
     </div>
   );

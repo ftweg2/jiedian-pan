@@ -237,7 +237,7 @@ export function Workspace({ user, onLogout }: { user: SessionUser; onLogout: () 
           )}
 
           {view === "users" && user.role === "admin" && (
-            <UsersPanel users={users} loading={adminLoading} reload={loadAdminData} toastSuccess={toast.success} toastError={toast.error} />
+            <UsersPanel currentUserId={user.id} users={users} loading={adminLoading} reload={loadAdminData} toastSuccess={toast.success} toastError={toast.error} />
           )}
 
           {view === "logs" && user.role === "admin" && (

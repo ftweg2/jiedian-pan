@@ -233,6 +233,71 @@ export async function buildServer(env: ApiEnv, prisma: PrismaClient) {
     return { user: serializeUserForResponse(enabled) };
   });
 
+  // DELETE /users/:id — permanently remove a user account.
+  //
+  // Safety rails:
+  //   - admin-only
+  //   - refuse to delete yourself (forces admin to use another admin account
+  //     if they really want their own account gone)
+  //   - refuse to delete the LAST admin (locks the instance out otherwise)
+  //   - require the user be disabled first (two-step confirmation by way of
+  //     the existing /disable endpoint)
+  //
+  // Side effects (run in one transaction so we never half-delete):
+  //   - any File / Folder owned by the user is **transferred** to the calling
+  //     admin (we never auto-delete data without explicit user action)
+  //   - Sessions / Permissions / AccessLog actor pointers are cleaned up
+  //   - ShareLinks created by the user remain (they're tied to the file, not
+  //     the user, and revoking the user shouldn't break recipients mid-flight)
+  app.delete<{ Params: { id: string } }>("/users/:id", async (request, reply) => {
+    const admin = await requireAdmin(prisma, request, reply);
+    if (!admin) return;
+
+    if (admin.id === request.params.id) {
+      return reply.code(400).send({ error: "cannot delete the account you are signed in as" });
+    }
+
+    const target = await prisma.user.findUnique({ where: { id: request.params.id } });
+    if (!target) return reply.code(404).send({ error: "user not found" });
+
+    if (!target.disabledAt) {
+      return reply.code(409).send({ error: "disable the user first" });
+    }
+
+    if (target.role === "ADMIN") {
+      const adminCount = await prisma.user.count({ where: { role: "ADMIN", disabledAt: null } });
+      // adminCount includes the disabled `target`? No — filter disabledAt: null.
+      // Same check we'd want either way: at least one active admin must remain
+      // AFTER deletion. Since target is already disabled, current active admins
+      // does not include them; we just need ≥ 1.
+      if (adminCount < 1) {
+        return reply.code(409).send({ error: "no other active admins" });
+      }
+    }
+
+    const ownedFiles = await prisma.file.count({ where: { ownerId: target.id } });
+    const ownedFolders = await prisma.folder.count({ where: { ownerId: target.id } });
+
+    await prisma.$transaction(async (tx) => {
+      // Transfer file/folder ownership to the deleting admin
+      if (ownedFiles > 0) {
+        await tx.file.updateMany({ where: { ownerId: target.id }, data: { ownerId: admin.id } });
+      }
+      if (ownedFolders > 0) {
+        await tx.folder.updateMany({ where: { ownerId: target.id }, data: { ownerId: admin.id } });
+      }
+      // Drop sessions + permissions
+      await tx.session.deleteMany({ where: { userId: target.id } });
+      await tx.permission.deleteMany({ where: { userId: target.id } });
+      // Preserve access logs but anonymize the actor
+      await tx.accessLog.updateMany({ where: { actorId: target.id }, data: { actorId: null } });
+      // Finally remove the user row
+      await tx.user.delete({ where: { id: target.id } });
+    });
+
+    return { deleted: true, transferredFiles: ownedFiles, transferredFolders: ownedFolders };
+  });
+
   app.post<{ Params: { id: string } }>("/users/:id/reset-password", async (request, reply) => {
     const admin = await requireAdmin(prisma, request, reply);
     if (!admin) return;
