@@ -167,7 +167,21 @@ export function FilesPanel(props: FilesPanelProps) {
 
   const isEmpty = !loading && folders.length === 0 && files.length === 0;
   const filteredEmpty = !loading && !isEmpty && visibleItems.length === 0;
-  const importantAtRisk = files.filter((file) => file.effectivePolicy === "important" && file.status !== "deleted" && file.replicaCount < 2);
+  const importantAtRisk = files.filter((file) => file.effectivePolicy === "important" && file.status === "active" && file.replicaCount < 2);
+  const failedFiles = files.filter((file) => file.status === "failed");
+  const [cleanupBusy, setCleanupBusy] = useState(false);
+  async function cleanupFailedUploads() {
+    setCleanupBusy(true);
+    try {
+      const res = await api<{ purged: number }>("/files/cleanup-failed", { method: "POST", body: "{}" });
+      await reload();
+      toastSuccess(`已清理 ${res.purged} 个失败上传残留`);
+    } catch (err) {
+      toastError(err instanceof Error ? err.message : "清理失败");
+    } finally {
+      setCleanupBusy(false);
+    }
+  }
 
   const selectedItems = visibleItems.filter((item) => selectedIds.has(itemKey(item)));
   const selectedFiles = files.filter((file) => selectedIds.has(`file:${file.id}`));
@@ -459,6 +473,24 @@ export function FilesPanel(props: FilesPanelProps) {
               <strong>{importantAtRisk.length} 个重要文件副本不足</strong>
               <span> · 打开文件详情查看副本状态</span>
             </div>
+          </div>
+        )}
+
+        {failedFiles.length > 0 && (
+          <div className="alert alert-warn" style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <Archive size={14} />
+            <div style={{ flex: 1 }}>
+              <strong>{failedFiles.length} 个失败上传残留</strong>
+              <span> · 这些上传没完成,没有可恢复数据,清理掉即可</span>
+            </div>
+            <button
+              type="button"
+              className="btn btn-secondary btn-sm"
+              onClick={cleanupFailedUploads}
+              disabled={cleanupBusy}
+            >
+              {cleanupBusy ? "清理中…" : "一键清理"}
+            </button>
           </div>
         )}
 
