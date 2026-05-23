@@ -377,14 +377,15 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   });
 
   if (!response.ok) {
-    // Global 401 handling: server says session is dead → bounce to login.
-    // Skip if the caller is the login/me endpoint itself.
+    // Global 401 handling: server says session is dead → reload the page so
+    // App.tsx re-runs /auth/me and shows the Login screen. The app doesn't
+    // have a separate /login route — it's a single-page conditional render.
+    // Skip if the caller is the login/me endpoint itself or share pages.
     if (response.status === 401 && !NO_REDIRECT_ON_401.some((p) => path.startsWith(p))) {
-      // Don't redirect from share-link recipient pages; those have their own
-      // auth flow and aren't under /api/auth.
       if (!window.location.pathname.startsWith("/s/") && !window.location.pathname.startsWith("/share")) {
-        // Tiny delay so any in-flight UI sees the error first.
-        setTimeout(() => { window.location.href = "/login"; }, 100);
+        // Just reload — App.tsx's /auth/me fail-path renders the Login page.
+        // Tiny delay so the calling code observes the error first.
+        setTimeout(() => { window.location.reload(); }, 100);
       }
     }
     throw new ApiError(response.status, await readErrorMessage(response));

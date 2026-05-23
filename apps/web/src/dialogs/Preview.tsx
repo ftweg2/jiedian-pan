@@ -1,8 +1,9 @@
 import { AlertCircle, Download, Link2, X } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { getDocument, GlobalWorkerOptions, type PDFDocumentProxy, type RenderTask } from "pdfjs-dist";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.mjs?url";
-import type { FileItem } from "../api.js";
+import { marked } from "marked";
+import { apiBase, type FileItem } from "../api.js";
 import { filePreviewUrl, getFileCategory, isDocxPreview, isPdfPreview, isTextPreview } from "../lib/category.js";
 import { formatBytes } from "../lib/format.js";
 import { FileTypeIcon } from "../components/FileIcon.js";
@@ -62,7 +63,7 @@ export function PreviewDialog({
         ) : isDocx ? (
           <iframe src={filePreviewUrl(file)} title={file.name} />
         ) : isText ? (
-          <iframe src={filePreviewUrl(file)} title={file.name} />
+          <InlineTextPreview file={file} />
         ) : (
           <div className="preview-empty">
             <span className="file-glyph"><FileTypeIcon file={file} size={28} /></span>
@@ -142,4 +143,82 @@ function PdfPreview({ file }: { file: FileItem }) {
       <div className="pdf-pages" ref={containerRef} />
     </div>
   );
+}
+
+/**
+ * Inline preview for text files (txt / md / json / csv / log / xml).
+ *
+ * Why not just <iframe src=filePreviewUrl>? Browsers handle inline text/plain
+ * inconsistently — Chrome sometimes refuses to render UTF-8 BOM-less content,
+ * sometimes triggers a download because of `content-disposition: inline`.
+ * The result was a totally blank iframe even though the API returned 200
+ * with the right bytes (user-reported regression).
+ *
+ * Inline rendering avoids the iframe entirely:
+ *   - .md → marked-parsed HTML (read-only)
+ *   - .json → pretty-printed
+ *   - others → <pre> with monospace
+ */
+function InlineTextPreview({ file }: { file: FileItem }) {
+  const [content, setContent] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const name = file.name.toLowerCase();
+  const isMd = file.mimeType === "text/markdown" || name.endsWith(".md");
+  const isJson = file.mimeType === "application/json" || name.endsWith(".json");
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`${apiBase}/files/${file.id}/preview`, { credentials: "include" });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const text = await res.text();
+        if (!cancelled) setContent(text);
+      } catch (err) {
+        if (!cancelled) setError(err instanceof Error ? err.message : "加载失败");
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [file.id]);
+
+  const html = useMemo(() => {
+    if (!content) return null;
+    if (isMd) {
+      try {
+        const result = marked.parse(content, { async: false });
+        if (typeof result === "string") return result;
+      } catch { /* fall through to pre */ }
+    }
+    if (isJson) {
+      try {
+        const pretty = JSON.stringify(JSON.parse(content), null, 2);
+        return `<pre>${escapeHtml(pretty)}</pre>`;
+      } catch { /* fall through to pre */ }
+    }
+    return `<pre>${escapeHtml(content)}</pre>`;
+  }, [content, isMd, isJson]);
+
+  if (error) {
+    return (
+      <div className="preview-empty">
+        <AlertCircle size={20} />
+        <strong>{file.name}</strong>
+        <span>预览失败: {error}</span>
+      </div>
+    );
+  }
+  if (html == null) {
+    return <div className="preview-loading">加载中…</div>;
+  }
+  return (
+    <div className="inline-text-preview" dangerouslySetInnerHTML={{ __html: html }} />
+  );
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }

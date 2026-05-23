@@ -137,9 +137,21 @@ export function TextFileEditor({
   const previewHtml = useMemo(() => {
     if (!isMd) return "";
     try {
-      return marked.parse(content, { async: false }) as string;
-    } catch {
-      return "<p>预览渲染失败</p>";
+      // marked v14: parse() can return a Promise if any extension is async.
+      // Force sync by passing { async: false } AND guarding against a Promise
+      // result (which would render as "[object Promise]" otherwise).
+      const result = marked.parse(content, { async: false });
+      if (typeof result === "string") return result;
+      // Should never happen with async: false, but be defensive.
+      return "<p class='muted'>预览加载中…</p>";
+    } catch (err) {
+      console.warn("marked.parse failed", err);
+      // Fall back to raw text so the user can still see content.
+      const escaped = content
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+      return `<pre>${escaped}</pre>`;
     }
   }, [content, isMd]);
 

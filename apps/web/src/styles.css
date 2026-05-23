@@ -1503,3 +1503,37 @@ button:focus-visible, .btn:focus-visible, .input:focus-visible,
 }
 .new-file-menu-item:hover { background: rgba(0, 0, 0, 0.05); }
 .new-file-menu-icon { color: var(--brand, #2bbf6b); display: inline-flex; flex-shrink: 0; }
+
+/* Inline text preview inside PreviewDialog (.md / .txt etc.) */
+.inline-text-preview {
+  background: #ffffff;
+  color: #1f2937;
+  padding: 24px 32px;
+  overflow: auto;
+  max-width: min(900px, 100%);
+  margin: 0 auto;
+  font-size: 14px;
+  line-height: 1.65;
+}
+.inline-text-preview pre {
+  background: rgba(0,0,0,0.04);
+  padding: 12px 14px;
+  border-radius: 6px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.inline-text-preview h1 { font-size: 24px; margin: 18px 0 12px; }
+.inline-text-preview h2 { font-size: 20px; margin: 20px 0 10px; }
+.inline-text-preview h3 { font-size: 17px; margin: 16px 0 8px; }
+.inline-text-preview p { margin: 0 0 10px; }
+.inline-text-preview ul, .inline-text-preview ol { padding-left: 22px; margin: 0 0 10px; }
+.inline-text-preview code { background: rgba(0,0,0,0.06); padding: 1px 5px; border-radius: 3px; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.9em; }
+.inline-text-preview pre code { background: transparent; padding: 0; }
+.inline-text-preview blockquote { border-left: 3px solid rgba(0,0,0,0.2); margin: 0 0 10px; padding: 4px 12px; color: #6b7280; }
+.inline-text-preview a { color: #2bbf6b; }
+.inline-text-preview table { border-collapse: collapse; margin: 0 0 10px; }
+.inline-text-preview th, .inline-text-preview td { border: 1px solid rgba(0,0,0,0.1); padding: 6px 10px; }

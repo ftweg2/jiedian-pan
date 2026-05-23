@@ -39,6 +39,7 @@ import { RenameDialog, type RenameTarget } from "../dialogs/Rename.js";
 import { MoveDialog } from "../dialogs/Move.js";
 import { NewFileMenu } from "../components/NewFileMenu.js";
 import { TextFileEditor } from "../dialogs/TextFileEditor.js";
+import { ErrorBoundary } from "../components/ErrorBoundary.js";
 import {
   compareFiles,
   countCategory,
@@ -297,7 +298,20 @@ export function FilesPanel(props: FilesPanelProps) {
         { key: "delete", label: "移入回收站", icon: <Trash2 size={14} />, danger: true, onClick: () => setDeleteTargets([item]) }
       ];
     }
+    const editable = isEditableFile(item.file);
     return [
+      ...(editable
+        ? [{
+            key: "edit",
+            label: "在线编辑",
+            icon: <Edit3 size={14} />,
+            onClick: () => {
+              setEditingFileId(item.file.id);
+              setEditingFileName(item.file.name);
+              setEditingFileMime(item.file.mimeType);
+            }
+          } satisfies ContextMenuEntry]
+        : []),
       { key: "preview", label: "预览", icon: <Eye size={14} />, onClick: () => setPreviewFile(item.file) },
       { key: "details", label: "查看详情", icon: <Info size={14} />, onClick: () => openDetails(item) },
       { key: "download", label: "下载", icon: <Download size={14} />, onClick: () => saveFile(item.file), disabled: busyAction === `download:${item.file.id}` },
@@ -618,14 +632,16 @@ export function FilesPanel(props: FilesPanelProps) {
       )}
 
       {editingFileId && (
-        <TextFileEditor
-          fileId={editingFileId}
-          fileName={editingFileName}
-          mimeType={editingFileMime}
-          onClose={() => setEditingFileId(null)}
-          onSaved={async () => { await reload(); toastSuccess("已保存"); }}
-          toastError={toastError}
-        />
+        <ErrorBoundary label="文件编辑器">
+          <TextFileEditor
+            fileId={editingFileId}
+            fileName={editingFileName}
+            mimeType={editingFileMime}
+            onClose={() => setEditingFileId(null)}
+            onSaved={async () => { await reload(); toastSuccess("已保存"); }}
+            toastError={toastError}
+          />
+        </ErrorBoundary>
       )}
 
       {deleteTargets && (
