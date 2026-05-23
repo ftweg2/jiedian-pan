@@ -67,8 +67,20 @@ services:
     depends_on:
       - api
     ports:
+      - "80:80"
+      - "443:443"
+      # Keep 8080 listening too so the old IP:8080 URL keeps working during
+      # the transition. Internally everything still resolves to nginx :80.
       - "8080:80"
+    volumes:
+      # Mount Let's Encrypt certs (read-only). nginx loads them at startup;
+      # certbot renews them on the host every 60-90 days and we just reload.
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+      # ACME HTTP-01 challenge webroot for cert renewals (so we never have to
+      # stop nginx to renew — just write into /var/www/certbot/.well-known/).
+      - certbot-webroot:/var/www/certbot
 
 volumes:
   postgres-data:
   local-agent-data:
+  certbot-webroot:
