@@ -489,8 +489,14 @@ export async function buildServer(env: ApiEnv, prisma: PrismaClient) {
     const user = await requireUser(prisma, request, reply);
     if (!user) return;
 
+    // Only ACTIVE files contribute to the "副本不足" risk list. PENDING means
+    // the upload is still mid-flight; FAILED means the upload aborted long ago
+    // and the row is a tombstone with no data (replicaCount=0, but that's
+    // expected). Showing them as "副本不足" is noise — the user can't fix it,
+    // there's nothing to back up. The proper fix is to purge them (see
+    // /files/:id/purge or the new failed-files cleanup below).
     const files = await prisma.file.findMany({
-      where: { status: { notIn: [FileStatus.DELETED, FileStatus.TRASHED] } },
+      where: { status: FileStatus.ACTIVE },
       include: {
         folder: true,
         versions: {
@@ -525,6 +531,27 @@ export async function buildServer(env: ApiEnv, prisma: PrismaClient) {
     }
 
     return { risks };
+  });
+
+  // POST /files/cleanup-failed — purge stale FAILED files (upload never
+  // completed, no chunks, no replicas). Safe to call any time; it's only
+  // deleting tombstones the user can't recover from. Returns the count.
+  app.post("/files/cleanup-failed", async (request, reply) => {
+    const user = await requireUser(prisma, request, reply);
+    if (!user) return;
+
+    const stale = await prisma.file.findMany({
+      where: { status: FileStatus.FAILED, ownerId: user.id },
+      select: { id: true }
+    });
+    for (const f of stale) {
+      await deleteReplicasForFile(prisma, f.id).catch(() => undefined);
+      await prisma.file.update({
+        where: { id: f.id },
+        data: { status: FileStatus.DELETED }
+      });
+    }
+    return { purged: stale.length };
   });
 
   app.get("/files/trash", async (request, reply) => {
@@ -3077,10 +3104,43 @@ function serializeFile(file: {
   createdAt: Date;
   updatedAt: Date;
   folder?: { defaultPolicy: unknown } | null;
-  versions?: Array<{ id: string; storageLayout?: unknown; chunkCount?: number | null; replicas?: Array<{ status: unknown }> }>;
+  versions?: Array<{
+    id: string;
+    storageLayout?: unknown;
+    chunkCount?: number | null;
+    replicas?: Array<{ status: unknown; nodeId?: string | null }>;
+    chunks?: Array<{ replicas?: Array<{ status: unknown; nodeId: string | null }> }>;
+  }>;
 }) {
   const latestVersion = file.versions?.[0];
-  const availableReplicas = latestVersion?.replicas?.filter((replica) => String(replica.status) === "AVAILABLE").length ?? 0;
+  // Compute "fully-replicated node count" — the number of nodes that hold ALL
+  // pieces of this file AVAILABLE. For whole-file layout that's just the
+  // count of AVAILABLE whole replicas. For chunked layout we intersect the
+  // AVAILABLE-replica node sets across chunks, because a node only "has"
+  // the file if it has every chunk.
+  let availableReplicas = 0;
+  if (latestVersion) {
+    const layout = String(latestVersion.storageLayout ?? "WHOLE").toLowerCase();
+    if (layout === "chunked" && latestVersion.chunks && latestVersion.chunks.length > 0) {
+      const perChunkNodeSets = latestVersion.chunks.map((chunk) =>
+        new Set(
+          (chunk.replicas ?? [])
+            .filter((r) => String(r.status) === "AVAILABLE" && r.nodeId)
+            .map((r) => r.nodeId as string)
+        )
+      );
+      // Intersection
+      const intersection = perChunkNodeSets.reduce<Set<string> | null>((acc, s) => {
+        if (acc === null) return new Set(s);
+        const next = new Set<string>();
+        for (const id of acc) if (s.has(id)) next.add(id);
+        return next;
+      }, null);
+      availableReplicas = intersection?.size ?? 0;
+    } else {
+      availableReplicas = latestVersion.replicas?.filter((replica) => String(replica.status) === "AVAILABLE").length ?? 0;
+    }
+  }
   const folderPolicy = file.folder ? String(file.folder.defaultPolicy).toLowerCase() : "standard";
   const policyOverride = file.policyOverride ? String(file.policyOverride).toLowerCase() : null;
   return {
