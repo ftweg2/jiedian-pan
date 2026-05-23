@@ -461,7 +461,9 @@ export async function buildServer(env: ApiEnv, prisma: PrismaClient) {
         versions: {
           orderBy: { createdAt: "desc" },
           take: 1,
-          include: { replicas: true }
+          // chunks.replicas is required so serializeFile can compute
+          // replicaCount correctly for chunked files (was always 0).
+          include: { replicas: true, chunks: { include: { replicas: true } } }
         }
       },
       orderBy: [{ createdAt: "desc" }, { id: "desc" }],
@@ -1143,7 +1145,7 @@ export async function buildServer(env: ApiEnv, prisma: PrismaClient) {
       },
       include: {
         folder: true,
-        versions: { orderBy: { createdAt: "desc" }, take: 1, include: { replicas: true } }
+        versions: { orderBy: { createdAt: "desc" }, take: 1, include: { replicas: true, chunks: { include: { replicas: true } } } }
       }
     });
     return { file: serializeFile(updated) };
@@ -1189,7 +1191,7 @@ export async function buildServer(env: ApiEnv, prisma: PrismaClient) {
       data: { status: FileStatus.ACTIVE },
       include: {
         folder: true,
-        versions: { orderBy: { createdAt: "desc" }, take: 1, include: { replicas: true } }
+        versions: { orderBy: { createdAt: "desc" }, take: 1, include: { replicas: true, chunks: { include: { replicas: true } } } }
       }
     });
     return { file: serializeFile(restored) };
