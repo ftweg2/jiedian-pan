@@ -101,6 +101,17 @@ CODE=$(API_HEAD -X POST -H content-type:application/json \
   "$BASE/users/$TEST_USER_ID/reset-password")
 [ "$CODE" = "200" ] && RECORD PASS "POST /users/:id/reset-password" || RECORD FAIL "POST /users/:id/reset-password" "$CODE"
 
+# delete self → 400 (safety rail)
+SELF_ID=$(python3 -c 'import json;print(json.load(open("'"$EVIDENCE"'/login.json"))["user"]["id"])')
+CODE=$(API_HEAD -X DELETE "$BASE/users/$SELF_ID")
+[ "$CODE" = "400" ] && RECORD PASS "DELETE /users/:id (self → 400)" || RECORD FAIL "delete-self check" "$CODE"
+
+# delete non-disabled user → 409 (safety rail)
+CODE=$(API_HEAD -X DELETE "$BASE/users/$TEST_USER_ID")
+[ "$CODE" = "409" ] && RECORD PASS "DELETE /users/:id (not-disabled → 409)" || RECORD FAIL "delete-must-disable check" "$CODE"
+
+# disable then delete (the actual deletion path is tested in cleanup section)
+
 # === 3. Folders ===
 section "folders"
 
@@ -526,8 +537,13 @@ curl -sS -c "$COOKIE" -H content-type:application/json \
   -d "{\"email\":\"$ADMIN_EMAIL\",\"password\":\"$ADMIN_PW\"}" \
   "$BASE/auth/login" -o /dev/null
 
-# delete test user
+# delete test user (full path: disable then hard-delete)
 API_HEAD -X POST "$BASE/users/$TEST_USER_ID/disable" > /dev/null
+DELRES=$(API_BODY -X DELETE "$BASE/users/$TEST_USER_ID")
+echo "$DELRES" > "$EVIDENCE/user-delete.json"
+DELETED=$(python3 -c 'import json;d=json.load(open("'"$EVIDENCE"'/user-delete.json"));print(d.get("deleted"))' 2>/dev/null)
+[ "$DELETED" = "True" ] && RECORD PASS "DELETE /users/:id (disabled → ok)" || RECORD FAIL "delete disabled user" "$DELRES"
+SAMPLE "DELETE /users/:id" "$EVIDENCE/user-delete.json"
 
 # delete folder share + folder + leftover files
 API_HEAD -X POST "$BASE/shares/$FSHARE_ID/revoke" > /dev/null 2>&1 || true
