@@ -208,7 +208,21 @@ export function TextFileEditor({
           )}
 
           {loaded && isDocx && (
-            <OnlyOfficeEditor fileId={fileId} onClose={onClose} toastError={toastError} />
+            <div className="stack-sm" style={{ padding: 32, textAlign: "center" }}>
+              <p style={{ fontSize: 14 }}>Word 文档不支持在线编辑。</p>
+              <p className="muted" style={{ fontSize: 12 }}>
+                下载到本地用 Word/WPS 编辑后,通过「上传」覆盖同名文件即可。
+              </p>
+              <div>
+                <a
+                  href={`${apiBase}/files/${fileId}/download`}
+                  className="btn btn-primary"
+                  style={{ display: "inline-flex", marginTop: 8 }}
+                >
+                  <Download size={14} /> 下载文件
+                </a>
+              </div>
+            </div>
           )}
 
           {loaded && !isText && !isDocx && (
@@ -220,95 +234,3 @@ export function TextFileEditor({
   );
 }
 
-/**
- * ONLYOFFICE Document Server iframe wrapper.
- *
- * Flow:
- *   1. Load /onlyoffice/web-apps/apps/api/documents/api.js (DocsAPI global).
- *   2. GET our /files/:id/onlyoffice/config to get the signed config blob.
- *   3. Call DocsAPI.DocEditor(elementId, config) — that injects the iframe.
- *
- * Saves happen via ONLYOFFICE → our callback URL, no work needed here.
- */
-function OnlyOfficeEditor({
-  fileId,
-  onClose,
-  toastError
-}: {
-  fileId: string;
-  onClose: () => void;
-  toastError: (m: string) => void;
-}) {
-  const containerId = `onlyoffice-${fileId}`;
-  const editorRef = useRef<any>(null);
-  const [loadError, setLoadError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        // 1. Load the DocsAPI script (cached after first load).
-        await loadOnlyOfficeApiScript();
-        if (cancelled) return;
-        // 2. Pull our config.
-        const { config } = await (await fetch(`${apiBase}/files/${fileId}/onlyoffice/config`, { credentials: "include" })).json();
-        if (cancelled) return;
-        if (!config) throw new Error("config missing");
-        // 3. Instantiate. DocEditor renders an iframe inside the container div.
-        const DocsAPI = (window as any).DocsAPI;
-        if (!DocsAPI) throw new Error("DocsAPI failed to load");
-        editorRef.current = new DocsAPI.DocEditor(containerId, {
-          ...config,
-          events: {
-            onError: (e: any) => toastError(`编辑器错误: ${e?.data ?? "unknown"}`),
-            onRequestClose: () => onClose()
-          }
-        });
-      } catch (err) {
-        if (!cancelled) setLoadError(err instanceof Error ? err.message : String(err));
-      }
-    })();
-    return () => {
-      cancelled = true;
-      try { editorRef.current?.destroyEditor(); } catch { /* ignore */ }
-    };
-  }, [fileId, containerId, onClose, toastError]);
-
-  if (loadError) {
-    return (
-      <div className="stack-sm" style={{ padding: 32, textAlign: "center" }}>
-        <p style={{ fontSize: 14, color: "#dc2626" }}>无法加载在线编辑器: {loadError}</p>
-        <p className="muted" style={{ fontSize: 12 }}>
-          可能 ONLYOFFICE 容器还在启动(首次需 1-2 分钟),或者未配置 ONLYOFFICE_JWT_SECRET。
-          稍后再试,或下载文件后用 Word/WPS 编辑。
-        </p>
-        <div>
-          <a href={`${apiBase}/files/${fileId}/download`} className="btn btn-primary" style={{ display: "inline-flex", marginTop: 8 }}>
-            <Download size={14} /> 下载文件
-          </a>
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div style={{ flex: 1, minHeight: 0, position: "relative" }}>
-      <div id={containerId} style={{ position: "absolute", inset: 0 }} />
-    </div>
-  );
-}
-
-let onlyOfficeScriptPromise: Promise<void> | null = null;
-function loadOnlyOfficeApiScript(): Promise<void> {
-  if (onlyOfficeScriptPromise) return onlyOfficeScriptPromise;
-  onlyOfficeScriptPromise = new Promise<void>((resolve, reject) => {
-    if ((window as any).DocsAPI) { resolve(); return; }
-    const script = document.createElement("script");
-    script.src = "/onlyoffice/web-apps/apps/api/documents/api.js";
-    script.async = true;
-    script.onload = () => resolve();
-    script.onerror = () => reject(new Error("failed to load ONLYOFFICE script"));
-    document.head.appendChild(script);
-  });
-  return onlyOfficeScriptPromise;
-}

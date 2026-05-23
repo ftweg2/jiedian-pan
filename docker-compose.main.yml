@@ -56,8 +56,6 @@ services:
       BOOTSTRAP_LOCAL_NODE_NAME: ${BOOTSTRAP_LOCAL_NODE_NAME:-main-local}
       BOOTSTRAP_LOCAL_NODE_URL: ${BOOTSTRAP_LOCAL_NODE_URL:-http://storage-agent-local:4010}
       BOOTSTRAP_LOCAL_NODE_TOKEN: ${LOCAL_AGENT_TOKEN:?LOCAL_AGENT_TOKEN is required}
-      ONLYOFFICE_JWT_SECRET: ${ONLYOFFICE_JWT_SECRET:-}
-      ONLYOFFICE_INTERNAL_API_URL: ${ONLYOFFICE_INTERNAL_API_URL:-http://api:4000}
     ports:
       - "4000:4000"
 
@@ -71,34 +69,6 @@ services:
     ports:
       - "8080:80"
 
-  # ONLYOFFICE Document Server: provides the in-browser Word/Excel/PPT editor.
-  # We only use the Word piece (docx) for now. The web nginx reverse-proxies
-  # /onlyoffice/* to here so the browser sees everything under one origin.
-  # The container talks to our API by hostname `api:4000` (same docker net).
-  #
-  # JWT: both sides share ONLYOFFICE_JWT_SECRET. The API signs the config it
-  # hands to ONLYOFFICE; ONLYOFFICE signs the callback it sends back. We
-  # verify the callback with the same secret.
-  onlyoffice:
-    image: onlyoffice/documentserver:8.2
-    restart: unless-stopped
-    environment:
-      JWT_ENABLED: "true"
-      JWT_SECRET: ${ONLYOFFICE_JWT_SECRET:?ONLYOFFICE_JWT_SECRET is required}
-      JWT_HEADER: "Authorization"
-      # Run with no extra DB / cache services — single-node mode is fine
-      # for a personal cloud (one editor at a time per doc).
-      USE_UNAUTHORIZED_STORAGE: "true"
-    expose:
-      - "80"
-    volumes:
-      - onlyoffice-data:/var/www/onlyoffice/Data
-      - onlyoffice-logs:/var/log/onlyoffice
-      - onlyoffice-cache:/var/lib/onlyoffice
-
 volumes:
   postgres-data:
   local-agent-data:
-  onlyoffice-data:
-  onlyoffice-logs:
-  onlyoffice-cache:

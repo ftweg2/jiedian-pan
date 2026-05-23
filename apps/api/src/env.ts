@@ -14,9 +14,6 @@ export interface ApiEnv {
   bootstrapLocalNodeName?: string;
   bootstrapLocalNodeUrl?: string;
   bootstrapLocalNodeToken?: string;
-  // Shared secret between API and ONLYOFFICE Document Server. When set,
-  // unlocks the docx in-browser editor. Leave unset to disable.
-  onlyofficeJwtSecret?: string;
 }
 
 export function loadEnv(): ApiEnv {
@@ -39,8 +36,7 @@ export function loadEnv(): ApiEnv {
     bootstrapAdminPassword: process.env.BOOTSTRAP_ADMIN_PASSWORD,
     bootstrapLocalNodeName: process.env.BOOTSTRAP_LOCAL_NODE_NAME,
     bootstrapLocalNodeUrl: process.env.BOOTSTRAP_LOCAL_NODE_URL,
-    bootstrapLocalNodeToken: process.env.BOOTSTRAP_LOCAL_NODE_TOKEN,
-    onlyofficeJwtSecret: process.env.ONLYOFFICE_JWT_SECRET
+    bootstrapLocalNodeToken: process.env.BOOTSTRAP_LOCAL_NODE_TOKEN
   };
 }
 

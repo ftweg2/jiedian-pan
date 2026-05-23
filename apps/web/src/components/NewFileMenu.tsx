@@ -35,11 +35,10 @@ export function NewFileMenu({
     };
   }, [open]);
 
-  async function create(kind: "txt" | "md" | "docx") {
+  async function create(kind: "txt" | "md") {
     const presets = {
       txt: { name: defaultName("新文档", "txt"), mimeType: "text/plain" },
-      md: { name: defaultName("新笔记", "md"), mimeType: "text/markdown" },
-      docx: { name: defaultName("新文档", "docx"), mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
+      md: { name: defaultName("新笔记", "md"), mimeType: "text/markdown" }
     } as const;
     const { name, mimeType } = presets[kind];
     setBusy(kind);
@@ -71,7 +70,6 @@ export function NewFileMenu({
         <div role="menu" className="new-file-menu">
           <MenuItem icon={<FileText size={14} />} label="文本文件 (.txt)" hint="纯文本笔记" onClick={() => create("txt")} />
           <MenuItem icon={<FileText size={14} />} label="Markdown (.md)" hint="带格式 + 实时预览" onClick={() => create("md")} />
-          <MenuItem icon={<FileText size={14} />} label="Word 文档 (.docx)" hint="Phase B 后支持在线编辑" onClick={() => create("docx")} />
         </div>
       )}
     </div>
